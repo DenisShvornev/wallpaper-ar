@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>AR-калькулятор обоев — прототип</title>
+<!-- This product includes the XR Engine software developed by Niantic Spatial, Inc.
+Copyright © 2026 Niantic Spatial, Inc. All rights reserved.
+License: https://github.com/8thwall/engine/blob/main/LICENSE -->
+<script src="https://cdn.jsdelivr.net/npm/@8thwall/engine-binary@1/dist/xr.js" async crossorigin="anonymous" data-preload-chunks="slam"></script>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"}}</script>
+<style>
+  :root{--bg:#0f1115;--card:#1a1d24;--fg:#f3f4f6;--mut:#9ca3af;--acc:#facc15;--ok:#22c55e;--bad:#ef4444;}
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;height:100%;background:#000;color:var(--fg);font:15px/1.4 -apple-system,system-ui,Roboto,sans-serif;overflow:hidden}
+  #xr8canvas,canvas.webxr{position:fixed;inset:0;width:100vw;height:100vh;display:none}
+  #ui{position:fixed;inset:0;pointer-events:none}
+  #ui > *{pointer-events:auto}
+  .hidden{display:none!important}
+  button{font:inherit;border:0;border-radius:12px;padding:12px 16px;background:#2a2f3a;color:var(--fg)}
+  button.primary{background:var(--acc);color:#111;font-weight:700}
+  button:disabled{opacity:.4}
+  input{font:inherit;width:100%;padding:8px;border-radius:8px;border:1px solid #333;background:#0b0d11;color:var(--fg)}
+  #start{position:absolute;inset:0;background:var(--bg);overflow:auto;padding:24px 20px calc(24px + env(safe-area-inset-bottom))}
+  #start h1{font-size:22px;margin:0 0 8px}
+  #start p{color:var(--mut);margin:6px 0}
+  #start .btns{display:flex;flex-direction:column;gap:10px;margin:20px 0}
+  #start ol{color:var(--mut);padding-left:20px}
+  .err{color:var(--bad);white-space:pre-wrap}
+  small.legal{display:block;margin-top:20px;color:#666;font-size:11px}
+  small.legal a{color:#888}
+  #hud{position:absolute;inset:0;pointer-events:none}
+  #hud > *{pointer-events:auto}
+  #topbar{position:absolute;top:0;left:0;right:0;padding:calc(10px + env(safe-area-inset-top)) 12px 10px;background:linear-gradient(#000a,#0000);font-size:12px;color:#ddd;pointer-events:none}
+  #hint{position:absolute;left:12px;right:12px;top:calc(56px + env(safe-area-inset-top));text-align:center;font-size:16px;font-weight:600;text-shadow:0 1px 3px #000;pointer-events:none}
+  #cross{position:absolute;left:50%;top:50%;width:28px;height:28px;margin:-14px 0 0 -14px;pointer-events:none}
+  #cross:before,#cross:after{content:"";position:absolute;background:#fff;box-shadow:0 0 2px #000}
+  #cross:before{left:13px;top:0;width:2px;height:28px}
+  #cross:after{top:13px;left:0;height:2px;width:28px}
+  #bottombar{position:absolute;left:0;right:0;bottom:0;padding:12px 12px calc(14px + env(safe-area-inset-bottom));display:flex;gap:8px;align-items:center;justify-content:space-between;background:linear-gradient(#0000,#000a)}
+  #btnPlace{width:76px;height:76px;border-radius:50%;font-size:30px;padding:0}
+  .seg{display:flex;background:#2a2f3a;border-radius:12px;overflow:hidden}
+  .seg button{border-radius:0;padding:10px 12px;background:transparent}
+  .seg button.on{background:#444b5a}
+  .lbl{position:absolute;transform:translate(-50%,-50%);background:#000c;color:#fff;padding:3px 8px;border-radius:8px;font-weight:700;font-size:15px;pointer-events:none;white-space:nowrap}
+  #toast{position:absolute;left:50%;bottom:120px;transform:translateX(-50%);background:#111e;padding:10px 14px;border-radius:10px;font-weight:600;pointer-events:none;transition:opacity .3s;opacity:0;max-width:90vw;text-align:center}
+  #panel{position:absolute;inset:0;background:var(--bg);overflow:auto;padding:calc(16px + env(safe-area-inset-top)) 16px calc(24px + env(safe-area-inset-bottom))}
+  #panel h2{font-size:18px;margin:18px 0 8px}
+  .card{background:var(--card);border-radius:12px;padding:12px;margin:8px 0}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .grid2 label{font-size:12px;color:var(--mut)}
+  .m{border-top:1px solid #2a2f3a;padding:10px 0}
+  .m:first-child{border-top:0}
+  .m .row{display:flex;justify-content:space-between;gap:8px;align-items:center}
+  .m .refs{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:6px}
+  .m .refs label{font-size:12px;color:var(--mut)}
+  .e{font-size:12px;margin-top:2px}
+  .good{color:var(--ok)} .warn{color:var(--acc)} .badc{color:var(--bad)}
+  .big{font-size:28px;font-weight:800}
+  .mut{color:var(--mut);font-size:13px}
+  .rowbtns{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+  textarea{width:100%;height:140px;background:#0b0d11;color:var(--fg);border-radius:8px;border:1px solid #333;font:12px monospace}
+</style>
+</head>
+<body>
+<canvas id="xr8canvas"></canvas>
+
+<div id="ui">
+  <div id="start">
+    <h1>AR-калькулятор обоев</h1>
+    <p>Прототип для проверки точности замеров без эталона.</p>
+    <div class="btns">
+      <button class="primary" id="btn8w">Запустить AR (8th Wall, iOS + Android)</button>
+      <button id="btnXR" disabled>WebXR / ARCore (только Android Chrome) — проверяю…</button>
+      <button id="btnList">Замеры и расчёт</button>
+    </div>
+    <div id="startErr" class="err"></div>
+    <p><b>Как мерить стену:</b></p>
+    <ol>
+      <li>Сначала 5–10 секунд медленно поводите телефоном по полу и немного пройдитесь, пока статус не станет «NORMAL».</li>
+      <li>Наведите крестик на <b>левый</b> угол стены у пола и нажмите «＋».</li>
+      <li>Наведите на <b>правый</b> угол у пола и нажмите «＋». Это ширина.</li>
+      <li>Поднимите телефон к потолку над правой точкой и нажмите «＋». Это высота.</li>
+    </ol>
+    <p>Чтобы проверить точность, в «Замерах» впишите значения рулетки: погрешность посчитается автоматически.</p>
+    <small class="legal">Использует XR Engine © 2026 Niantic Spatial, Inc. <a href="https://github.com/8thwall/engine/blob/main/LICENSE" target="_blank">Лицензия</a>. three.js — MIT.</small>
+  </div>
+
+  <div id="hud" class="hidden">
+    <div id="topbar">—</div>
+    <div id="hint"></div>
+    <div id="cross"></div>
+    <div id="labels"></div>
+    <div id="toast"></div>
+    <div id="bottombar">
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <div class="seg"><button id="toolWall" class="on">Стена</button><button id="toolLine">Линейка</button></div>
+        <div style="display:flex;gap:8px"><button id="btnUndo">↶</button><button id="btnRecenter" title="Сброс трекинга">⟲</button><button id="btnExit" class="hidden">✕</button></div>
+      </div>
+      <button id="btnPlace" class="primary">＋</button>
+      <button id="btnPanel">Замеры<br><span id="cnt">0</span></button>
+    </div>
+  </div>
+
+  <div id="panel" class="hidden">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <b style="font-size:18px">Замеры и расчёт</b>
+      <button id="btnClose">Закрыть</button>
+    </div>
+
+    <h2>Расчёт обоев</h2>
+    <div class="card">
+      <div class="grid2">
+        <div><label>Ширина рулона, м</label><input id="pRollW" type="number" step="0.01" value="1.06"></div>
+        <div><label>Длина рулона, м</label><input id="pRollL" type="number" step="0.01" value="10.05"></div>
+        <div><label>Раппорт, см</label><input id="pRap" type="number" step="1" value="0"></div>
+        <div><label>Запас на подрезку, см</label><input id="pTrim" type="number" step="1" value="10"></div>
+        <div><label>Окна и двери, м²</label><input id="pOpen" type="number" step="0.1" value="0"></div>
+        <div><label>Резерв, %</label><input id="pRes" type="number" step="1" value="5"></div>
+      </div>
+      <div id="result" style="margin-top:12px"></div>
+    </div>
+
+    <h2>Точность</h2>
+    <div class="card" id="stats"><span class="mut">Впишите значения рулетки к замерам ниже.</span></div>
+
+    <h2>Замеры <span class="mut">(в расчёт идут только «стены»)</span></h2>
+    <div class="card" id="list"></div>
+    <div class="rowbtns">
+      <button id="btnCopy">Скопировать отчёт</button>
+      <button id="btnClear">Удалить все</button>
+    </div>
+    <textarea id="report" class="hidden" readonly></textarea>
+  </div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+window.THREE = THREE;
+
+const $ = id => document.getElementById(id);
+const V3 = THREE.Vector3;
+
+const STORE = 'wallpaperAR.v1';
+const state = {
+  engine: null,
+  tool: 'wall',
+  step: 0,
+  A: null, B: null,
+  hit: null, hitType: '',
+  liveW: null, liveH: null,
+  tracking: '…',
+  measurements: load(),
+};
+function load(){ try { return JSON.parse(localStorage.getItem(STORE)) || []; } catch { return []; } }
+function save(){ try { localStorage.setItem(STORE, JSON.stringify(state.measurements)); } catch {} }
+
+let scene = null, getCam = null;
+let reticle, dotA, dotB, barAB, barV;
+const O = new V3(), D = new V3(), tmp = new V3(), top = new V3();
+
+function initSceneObjects(sc){
+  scene = sc;
+  const g = new THREE.Group(); sc.add(g);
+  reticle = new THREE.Mesh(new THREE.RingGeometry(0.035, 0.05, 32).rotateX(-Math.PI/2),
+    new THREE.MeshBasicMaterial({color:0xffffff, depthTest:false, transparent:true, opacity:.9, side:THREE.DoubleSide}));
+  reticle.renderOrder = 10; reticle.visible = false; g.add(reticle);
+  const dot = c => { const m = new THREE.Mesh(new THREE.SphereGeometry(0.018, 16, 12), new THREE.MeshBasicMaterial({color:c, depthTest:false})); m.renderOrder = 11; m.visible = false; g.add(m); return m; };
+  const bar = c => { const m = new THREE.Mesh(new THREE.CylinderGeometry(0.006, 0.006, 1, 8), new THREE.MeshBasicMaterial({color:c, depthTest:false})); m.renderOrder = 11; m.visible = false; g.add(m); return m; };
+  dotA = dot(0x22c55e); dotB = dot(0x3b82f6); barAB = bar(0xfacc15); barV = bar(0xff4d6d);
+}
+const UP = new V3(0,1,0);
+function setBar(m, a, b){
+  tmp.subVectors(b, a); const len = tmp.length();
+  if (len < 1e-4){ m.visible = false; return; }
+  m.position.addVectors(a, b).multiplyScalar(.5);
+  m.scale.set(1, len, 1);
+  m.quaternion.setFromUnitVectors(UP, tmp.normalize());
+  m.visible = true;
+}
+const hdist = (a, b) => Math.hypot(b.x - a.x, b.z - a.z);
+
+function heightOnVertical(base, o, d){
+  const w0x = o.x - base.x, w0y = o.y - base.y, w0z = o.z - base.z;
+  const a = d.dot(d), b = d.y, c = 1;
+  const dd = d.x*w0x + d.y*w0y + d.z*w0z, e = w0y;
+  const den = a*c - b*b;
+  if (den < 1e-6) return null;
+  const s = (b*e - c*dd) / den;
+  if (s <= 0) return null;
+  return (a*e - b*dd) / den;
+}
+
+const labW = mkLabel(), labH = mkLabel();
+function mkLabel(){ const el = document.createElement('div'); el.className = 'lbl hidden'; $('labels').appendChild(el); return el; }
+function placeLabel(el, p, cam, text){
+  tmp.copy(p).applyMatrix4(cam.matrixWorldInverse).applyMatrix4(cam.projectionMatrix);
+  if (tmp.z > 1 || tmp.z < -1){ el.classList.add('hidden'); return; }
+  el.style.left = ((tmp.x + 1) / 2 * innerWidth) + 'px';
+  el.style.top = ((1 - tmp.y) / 2 * innerHeight) + 'px';
+  el.textContent = text; el.classList.remove('hidden');
+}
+const cm = m => (m * 100).toFixed(1) + ' см';
+
+function viewCam(){
+  let c = getCam && getCam(); if (!c) return null;
+  if (c.isArrayCamera && c.cameras.length) c = c.cameras[0];
+  c.matrixWorldInverse.copy(c.matrixWorld).invert();
+  return c;
+}
+function tick(){
+  const cam = viewCam(); if (!cam || !reticle) return;
+  O.setFromMatrixPosition(cam.matrixWorld);
+  D.set(0, 0, -1).transformDirection(cam.matrixWorld);
+  const s = state;
+
+  if (s.tool === 'wall' && s.step === 2){
+    reticle.visible = false;
+    const t = heightOnVertical(s.B, O, D);
+    s.liveH = t;
+    if (t && t > 0.02){ top.set(s.B.x, s.B.y + t, s.B.z); setBar(barV, s.B, top); tmp.set(s.B.x, s.B.y + t/2, s.B.z); placeLabel(labH, tmp.clone(), cam, 'В ' + cm(t)); }
+    else { barV.visible = false; labH.classList.add('hidden'); }
+  } else {
+    if (s.hit){ reticle.position.copy(s.hit); reticle.visible = true; } else reticle.visible = false;
+    if (s.step === 1 && s.hit){
+      setBar(barAB, s.A, s.hit); s.liveW = hdist(s.A, s.hit);
+      placeLabel(labW, tmp.addVectors(s.A, s.hit).multiplyScalar(.5).clone(), cam, cm(s.liveW));
+    }
+  }
+  if (s.A && s.B && !(s.step === 1)){
+    placeLabel(labW, new V3().addVectors(s.A, s.B).multiplyScalar(.5), cam, 'Ш ' + cm(hdist(s.A, s.B)));
+  }
+  if (s.lastH && s.B && s.step === 0){
+    placeLabel(labH, new V3(s.B.x, s.B.y + s.lastH/2, s.B.z), cam, 'В ' + cm(s.lastH));
+  }
+  updateHUD();
+}
+
+let lastHud = '';
+function updateHUD(){
+  const s = state;
+  const trk = 'Трекинг: ' + s.tracking + ' · ' + (s.engine === 'webxr' ? 'WebXR/ARCore' : '8th Wall, absolute scale') + ' · пол: ' + (s.hit ? s.hitType : 'не найден');
+  let hint;
+  if (s.tool === 'wall') hint = ['Наведите на ЛЕВЫЙ угол стены у пола', 'Наведите на ПРАВЫЙ угол стены у пола', 'Поднимите крестик к потолку над синей точкой'][s.step];
+  else hint = ['Линейка: первая точка на полу', 'Линейка: вторая точка на полу'][s.step];
+  const h = trk + '|' + hint;
+  if (h !== lastHud){ $('topbar').textContent = trk; $('hint').textContent = hint; lastHud = h; }
+  const needHit = !(s.tool === 'wall' && s.step === 2);
+  $('btnPlace').disabled = needHit ? !s.hit : !(s.liveH > 0.05);
+}
+let toastT;
+function toast(msg){ const t = $('toast'); t.textContent = msg; t.style.opacity = 1; clearTimeout(toastT); toastT = setTimeout(() => t.style.opacity = 0, 2200); }
+
+function clearVisuals(){
+  [dotA, dotB, barAB, barV].forEach(o => o && (o.visible = false));
+  labW.classList.add('hidden'); labH.classList.add('hidden');
+  state.A = state.B = null; state.lastH = null;
+}
+function place(){
+  const s = state;
+  if (s.step === 0){
+    if (!s.hit) return;
+    clearVisuals();
+    s.A = s.hit.clone(); dotA.position.copy(s.A); dotA.visible = true; s.step = 1;
+  } else if (s.step === 1){
+    if (!s.hit) return;
+    s.B = s.hit.clone(); dotB.position.copy(s.B); dotB.visible = true; setBar(barAB, s.A, s.B);
+    const w = hdist(s.A, s.B);
+    if (s.tool === 'line'){ addMeasurement({type:'line', w}); toast('Линейка: ' + cm(w)); s.step = 0; }
+    else s.step = 2;
+  } else if (s.step === 2){
+    const h = s.liveH; if (!(h > 0.05)) return;
+    const w = hdist(s.A, s.B);
+    addMeasurement({type:'wall', w, h});
+    s.lastH = h; s.step = 0;
+    toast('Стена сохранена: ' + cm(w) + ' × ' + cm(h));
+  }
+  if (navigator.vibrate) navigator.vibrate(15);
+}
+function undo(){
+  const s = state;
+  if (s.step === 2){ s.step = 1; s.B = null; dotB.visible = false; barV.visible = false; labH.classList.add('hidden'); }
+  else if (s.step === 1){ clearVisuals(); s.step = 0; }
+  else clearVisuals();
+}
+function addMeasurement(m){
+  state.measurements.push({id: Date.now(), engine: state.engine, ts: new Date().toISOString(), refW: null, refH: null, ...m});
+  save(); $('cnt').textContent = state.measurements.length;
+}
+function setTool(t){
+  state.tool = t; state.step = 0; clearVisuals();
+  $('toolWall').classList.toggle('on', t === 'wall'); $('toolLine').classList.toggle('on', t === 'line');
+}
+
+function waitXR8(ms = 30000){
+  return new Promise((res, rej) => {
+    if (window.XR8) return res(window.XR8);
+    const to = setTimeout(() => rej(new Error('Движок 8th Wall не загрузился (проверьте доступ к cdn.jsdelivr.net).')), ms);
+    window.addEventListener('xrloaded', () => { clearTimeout(to); res(window.XR8); }, {once: true});
+  });
+}
+async function requestMotion(){
+  try { if (window.DeviceMotionEvent?.requestPermission) await DeviceMotionEvent.requestPermission(); } catch {}
+  try { if (window.DeviceOrientationEvent?.requestPermission) await DeviceOrientationEvent.requestPermission(); } catch {}
+}
+function sizeCanvas(c){ const dpr = Math.min(devicePixelRatio || 1, 2); c.width = innerWidth * dpr; c.height = innerHeight * dpr; }
+const groundHit = new V3();
+async function start8w(){
+  await requestMotion();
+  const XR8 = await waitXR8();
+  const canvas = $('xr8canvas'); canvas.style.display = 'block'; sizeCanvas(canvas);
+  state.engine = '8thwall';
+  XR8.XrController.configure({scale: 'absolute'});
+  const mods = [XR8.GlTextureRenderer.pipelineModule(), XR8.Threejs.pipelineModule(), XR8.XrController.pipelineModule()];
+  if (XR8.FullWindowCanvas) mods.push(XR8.FullWindowCanvas.pipelineModule());
+  else addEventListener('resize', () => sizeCanvas(canvas));
+  mods.push({
+    name: 'wallpaper-calc',
+    onStart: () => { const {scene: sc, camera} = XR8.Threejs.xrScene(); getCam = () => camera; initSceneObjects(sc); },
+    onRender: () => {
+      if (!scene) return;
+      let hits = [];
+      try { hits = XR8.XrController.hitTest(0.5, 0.5, ['DETECTED_SURFACE', 'ESTIMATED_SURFACE']) || []; } catch {}
+      if (hits.length){ const p = hits[0].position; state.hit = new V3(p.x, p.y, p.z); state.hitType = hits[0].type; }
+      else {
+        const cam = viewCam();
+        if (cam){ O.setFromMatrixPosition(cam.matrixWorld); D.set(0,0,-1).transformDirection(cam.matrixWorld);
+          if (D.y < -0.05){ const t = -O.y / D.y; groundHit.copy(O).addScaledVector(D, t); state.hit = groundHit.clone(); state.hitType = 'y=0'; } else state.hit = null; }
+      }
+      tick();
+    },
+    listeners: [{event: 'reality.trackingstatus', process: ({detail}) => { state.tracking = detail.status + (detail.reason && detail.reason !== 'UNSPECIFIED' ? ' (' + detail.reason + ')' : ''); }}],
+    onCameraStatusChange: ({status}) => { if (status === 'failed') fail('Нет доступа к камере. Разрешите камеру в настройках браузера.'); },
+    onException: e => fail('Ошибка движка: ' + (e?.message || e)),
+  });
+  XR8.addCameraPipelineModules(mods);
+  showHUD();
+  XR8.run({canvas});
+}
+
+async function startWebXR(){
+  const renderer = new THREE.WebGLRenderer({antialias: true, alpha: true});
+  renderer.setPixelRatio(devicePixelRatio); renderer.setSize(innerWidth, innerHeight);
+  renderer.xr.enabled = true; renderer.domElement.className = 'webxr';
+  document.body.appendChild(renderer.domElement);
+  const sc = new THREE.Scene(); const camera = new THREE.PerspectiveCamera(70, innerWidth/innerHeight, 0.01, 50);
+  initSceneObjects(sc);
+  const session = await navigator.xr.requestSession('immersive-ar', {requiredFeatures: ['hit-test'], optionalFeatures: ['dom-overlay'], domOverlay: {root: $('ui')}});
+  state.engine = 'webxr';
+  renderer.xr.setReferenceSpaceType('local');
+  await renderer.xr.setSession(session);
+  const viewer = await session.requestReferenceSpace('viewer');
+  const hitSource = await session.requestHitTestSource({space: viewer});
+  getCam = () => renderer.xr.getCamera();
+  session.addEventListener('end', () => location.reload());
+  $('btnExit').classList.remove('hidden'); $('btnRecenter').classList.add('hidden');
+  $('btnExit').onclick = () => session.end();
+  const M = new THREE.Matrix4(), N = new V3();
+  showHUD();
+  renderer.setAnimationLoop((t, frame) => {
+    renderer.render(sc, camera);
+    if (!frame) return;
+    const ref = renderer.xr.getReferenceSpace();
+    const vp = frame.getViewerPose(ref);
+    state.tracking = vp ? (vp.emulatedPosition ? 'LIMITED' : 'NORMAL') : 'LOST';
+    state.hit = null;
+    for (const r of frame.getHitTestResults(hitSource)){
+      const p = r.getPose(ref); if (!p) continue;
+      M.fromArray(p.transform.matrix); N.setFromMatrixColumn(M, 1);
+      if (N.y > 0.85){ state.hit = new V3().setFromMatrixPosition(M); state.hitType = 'plane'; break; }
+    }
+    tick();
+  });
+}
+
+const num = id => parseFloat($(id).value.replace(',', '.')) || 0;
+function calc(walls, k = 1){
+  const rollW = num('pRollW'), rollL = num('pRollL'), rap = num('pRap')/100, trim = num('pTrim')/100, open = num('pOpen'), res = num('pRes');
+  if (!walls.length || rollW <= 0 || rollL <= 0) return null;
+  let strips = 0, maxH = 0, sumW = 0;
+  for (const w of walls){ const W = w.w * k, H = w.h * k; strips += Math.ceil(W / rollW - 1e-9); maxH = Math.max(maxH, H); sumW += W; }
+  let stripLen = maxH + trim; if (rap > 0) stripLen = Math.ceil(stripLen / rap - 1e-9) * rap;
+  const spr = Math.floor(rollL / stripLen + 1e-9);
+  if (spr < 1) return {error: 'Полоса длиннее рулона'};
+  const need = Math.max(0, strips - Math.floor(open / (rollW * maxH)));
+  return {strips: need, spr, stripLen, rolls: Math.ceil(need * (1 + res/100) / spr - 1e-9), sumW, maxH};
+}
+const errPct = (m, r) => (r > 0 ? (m * 100 - r) / r * 100 : null);
+const cls = e => Math.abs(e) <= 3 ? 'good' : Math.abs(e) <= 10 ? 'warn' : 'badc';
+function renderPanel(){
+  const ms = state.measurements, walls = ms.filter(m => m.type === 'wall');
+  const r = calc(walls), lo = calc(walls, 0.9), hi = calc(walls, 1.1);
+  $('result').innerHTML = !r ? '<span class="mut">Нет замеренных стен.</span>' : r.error ? `<span class="badc">${r.error}</span>` :
+    `<div class="big">${r.rolls} рул.</div>
+     <div class="mut">Стен: ${walls.length} · сумма ширин ${r.sumW.toFixed(2)} м · макс. высота ${r.maxH.toFixed(2)} м<br>
+     Полос: ${r.strips} · полоса ${r.stripLen.toFixed(2)} м · полос из рулона: ${r.spr}<br>
+     При погрешности ±10%: от ${lo && !lo.error ? lo.rolls : '—'} до ${hi && !hi.error ? hi.rolls : '—'} рул.</div>`;
+
+  const errs = {};
+  for (const m of ms){
+    const add = e => { if (e === null) return; (errs[m.engine] ||= []).push(e); };
+    if (m.refW) add(errPct(m.w, m.refW));
+    if (m.type === 'wall' && m.refH) add(errPct(m.h, m.refH));
+  }
+  const keys = Object.keys(errs);
+  $('stats').innerHTML = !keys.length ? '<span class="mut">Впишите значения рулетки к замерам ниже.</span>' : keys.map(k => {
+    const a = errs[k].map(Math.abs), mean = a.reduce((x, y) => x + y, 0) / a.length, max = Math.max(...a);
+    const sorted = [...a].sort((x, y) => x - y), med = sorted[Math.floor(sorted.length/2)];
+    const bias = errs[k].reduce((x, y) => x + y, 0) / a.length;
+    return `<div><b>${k === 'webxr' ? 'WebXR/ARCore' : '8th Wall'}</b> — сравнений: ${a.length}<br>
+      средняя |ошибка|: <b class="${cls(mean)}">${mean.toFixed(1)}%</b> · медиана ${med.toFixed(1)}% · максимум <span class="${cls(max)}">${max.toFixed(1)}%</span><br>
+      <span class="mut">систематический сдвиг ${bias > 0 ? '+' : ''}${bias.toFixed(1)}% (${bias > 0 ? 'завышает' : 'занижает'})</span></div>`;
+  }).join('<hr style="border-color:#2a2f3a">');
+
+  $('list').innerHTML = !ms.length ? '<span class="mut">Пока пусто.</span>' : ms.slice().reverse().map(m => {
+    const eW = m.refW ? errPct(m.w, m.refW) : null, eH = m.type === 'wall' && m.refH ? errPct(m.h, m.refH) : null;
+    return `<div class="m" data-id="${m.id}">
+      <div class="row"><div><b>${m.type === 'wall' ? 'Стена' : 'Линейка'}</b> · ${m.engine === 'webxr' ? 'WebXR' : '8th Wall'}<br>
+        <span class="mut">Ш ${cm(m.w)}${m.type === 'wall' ? ' · В ' + cm(m.h) : ''}</span></div>
+        <button data-del="${m.id}">✕</button></div>
+      <div class="refs">
+        <div><label>Рулетка: ${m.type === 'wall' ? 'ширина' : 'длина'}, см</label><input inputmode="decimal" data-ref="refW" value="${m.refW ?? ''}">
+          ${eW !== null ? `<div class="e ${cls(eW)}">ошибка ${eW > 0 ? '+' : ''}${eW.toFixed(1)}%</div>` : ''}</div>
+        ${m.type === 'wall' ? `<div><label>Рулетка: высота, см</label><input inputmode="decimal" data-ref="refH" value="${m.refH ?? ''}">
+          ${eH !== null ? `<div class="e ${cls(eH)}">ошибка ${eH > 0 ? '+' : ''}${eH.toFixed(1)}%</div>` : ''}</div>` : ''}
+      </div></div>`;
+  }).join('');
+}
+$('list').addEventListener('change', e => {
+  const inp = e.target.closest('input[data-ref]'); if (!inp) return;
+  const id = +inp.closest('.m').dataset.id, m = state.measurements.find(x => x.id === id);
+  const v = parseFloat(inp.value.replace(',', '.'));
+  m[inp.dataset.ref] = v > 0 ? v : null; save(); renderPanel();
+});
+$('list').addEventListener('click', e => {
+  const b = e.target.closest('button[data-del]'); if (!b) return;
+  state.measurements = state.measurements.filter(x => x.id !== +b.dataset.del); save(); renderPanel(); $('cnt').textContent = state.measurements.length;
+});
+['pRollW','pRollL','pRap','pTrim','pOpen','pRes'].forEach(id => $(id).addEventListener('input', renderPanel));
+$('btnCopy').onclick = async () => {
+  const lines = ['type;engine;measured_w_cm;ref_w_cm;err_w_%;measured_h_cm;ref_h_cm;err_h_%;time'];
+  for (const m of state.measurements){
+    const eW = m.refW ? errPct(m.w, m.refW).toFixed(1) : '', eH = m.type === 'wall' && m.refH ? errPct(m.h, m.refH).toFixed(1) : '';
+    lines.push([m.type, m.engine, (m.w*100).toFixed(1), m.refW ?? '', eW, m.h ? (m.h*100).toFixed(1) : '', m.refH ?? '', eH, m.ts].join(';'));
+  }
+  const txt = '# ' + navigator.userAgent + '\n' + lines.join('\n');
+  const ta = $('report'); ta.value = txt; ta.classList.remove('hidden');
+  try { await navigator.clipboard.writeText(txt); $('btnCopy').textContent = 'Скопировано ✓'; } catch { ta.select(); }
+};
+$('btnClear').onclick = () => { if (confirm('Удалить все замеры?')){ state.measurements = []; save(); renderPanel(); $('cnt').textContent = 0; } };
+
+function showHUD(){ $('start').classList.add('hidden'); $('hud').classList.remove('hidden'); $('cnt').textContent = state.measurements.length; }
+function fail(msg){ $('hud').classList.add('hidden'); $('start').classList.remove('hidden'); $('startErr').textContent = msg; }
+function openPanel(){ renderPanel(); $('panel').classList.remove('hidden'); }
+$('btnPanel').onclick = openPanel; $('btnList').onclick = openPanel;
+$('btnClose').onclick = () => $('panel').classList.add('hidden');
+$('btnPlace').onclick = place; $('btnUndo').onclick = undo;
+$('toolWall').onclick = () => setTool('wall'); $('toolLine').onclick = () => setTool('line');
+$('btnRecenter').onclick = () => { try { window.XR8?.XrController.recenter(); } catch {} setTool(state.tool); toast('Трекинг сброшен — снова поводите телефоном по полу'); };
+$('ui').addEventListener('beforexrselect', e => e.preventDefault());
+
+$('btn8w').onclick = () => start8w().catch(e => fail(String(e.message || e)));
+$('btnXR').onclick = () => startWebXR().catch(e => fail('WebXR: ' + (e.message || e)));
+(async () => {
+  const b = $('btnXR');
+  let ok = false; try { ok = !!navigator.xr && await navigator.xr.isSessionSupported('immersive-ar'); } catch {}
+  b.disabled = !ok; b.textContent = ok ? 'Запустить AR (WebXR / ARCore, Android)' : 'WebXR AR недоступен на этом устройстве';
+})();
+</script>
+</body>
+</html>
