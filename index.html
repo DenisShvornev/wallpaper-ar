@@ -209,7 +209,7 @@ function viewCam(){
   return c;
 }
 function tick(){
-  const cam = viewCam(); if (!cam || !reticle) return; if (state.tool === 'auto'){ Auto.update(cam); updateHUD(); return; }
+  const cam = viewCam(); if (!cam || !reticle) return; if (!Auto.calibUpdate(cam, state)){ reticle.visible = false; updateHUD();  Auto.update(cam); updateHUD(); return; }
   O.setFromMatrixPosition(cam.matrixWorld);
   D.set(0, 0, -1).transformDirection(cam.matrixWorld);
   const s = state;
@@ -243,10 +243,10 @@ function updateHUD(){
   let hint;
   if (s.tool === 'wall') hint = ['Наведите на ЛЕВЫЙ угол стены у пола', 'Наведите на ПРАВЫЙ угол стены у пола', 'Поднимите крестик к потолку над синей точкой'][s.step];
   else hint = ['Линейка: первая точка на полу', 'Линейка: вторая точка на полу'][s.step];
-  if (s.tool === 'auto'){ hint = Auto.hint(); trk += ' · ' + Auto.info(); } const h = trk + '|' + hint;
+  if (s.tool === 'auto' || !Auto.isCalibrated()){ hint = Auto.hint(); trk += ' · ' + Auto.info(); } const h = trk + '|' + hint;
   if (h !== lastHud){ $('topbar').textContent = trk; $('hint').textContent = hint; lastHud = h; }
   const needHit = !(s.tool === 'wall' && s.step === 2);
-  $('btnPlace').disabled = needHit ? !s.hit : !(s.liveH > 0.05); if (s.tool === 'auto') $('btnPlace').disabled = !Auto.canSave();
+  $('btnPlace').disabled = needHit ? !s.hit : !(s.liveH > 0.05); if (s.tool === 'auto' || !Auto.isCalibrated()) $('btnPlace').disabled = !Auto.canSave();
 }
 let toastT;
 function toast(msg){ const t = $('toast'); t.textContent = msg; t.style.opacity = 1; clearTimeout(toastT); toastT = setTimeout(() => t.style.opacity = 0, 2200); }
@@ -456,7 +456,7 @@ $('btnPanel').onclick = openPanel; $('btnList').onclick = openPanel;
 $('btnClose').onclick = () => $('panel').classList.add('hidden');
 $('btnPlace').onclick = () => state.tool === 'auto' ? Auto.save(addMeasurement, toast) : place(); $('tapzone').addEventListener('click', () => { if (state.tool === 'auto') Auto.tap(); else if (!$('btnPlace').disabled) place(); }); $('btnUndo').onclick = () => state.tool === 'auto' ? Auto.reset() : undo();
 $('toolWall').onclick = () => setTool('wall'); $('toolLine').onclick = () => setTool('line'); $('toolAuto').onclick = () => state.engine === '8thwall' ? setTool('auto') : toa
-$('btnRecenter').onclick = () => { try { window.XR8?.XrController.recenter(); } catch {} setTool(state.tool); toast('Трекинг сброшен — снова поводите телефоном по полу'); };
+$('btnRecenter').onclick = () => { Auto.recalibrate(); try { window.XR8?.XrController.recenter(); } catch {} setTool(state.tool); toast('Трекинг сброшен — снова поводите телефоном по полу'); };
 $('ui').addEventListener('beforexrselect', e => e.preventDefault());
 
 $('btn8w').onclick = () => start8w().catch(e => fail(String(e.message || e)));

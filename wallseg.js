@@ -1,42 +1,42 @@
-// Авто-определение стены: SegFormer-B0 (ADE20K) в браузере + геометрия по плоскости пола из SLAM.
-// Модель: Xenova/segformer-b0-finetuned-ade-512-512 (4.4 МБ, q8), Transformers.js в фоновом потоке (segworker.js).
-// Нейросеть запускается только на «хороших» кадрах: телефон неподвижен, трекинг NORMAL. Результат закрепляется в мире AR.
+// Замер стены по краям: калибровка -> левый угол -> правый угол -> потолок.
+// Нейросеть SegFormer-B0 (ADE20K, Transformers.js, фоновый поток segworker.js) запускается только на неподвижном кадре
+// с хорошим трекингом. Каждый найденный край закрепляется точкой в мире AR, накопления/расширения нет.
 export const WALL = 0, CEIL = 5;
 export const WALLISH = new Set([0, 1, 8, 14, 18, 22, 25, 27]); // wall, building, windowpane, door, curtain, painting, house, mirror
 export const FLOORISH = new Set([3, 6, 11, 13, 28]);           // floor, road, sidewalk, earth, rug
 
 // ---------- Чистая геометрия (без three.js — тестируется в node) ----------
 const mul4 = (e, x, y, z, w) => [e[0]*x + e[4]*y + e[8]*z + e[12]*w, e[1]*x + e[5]*y + e[9]*z + e[13]*w, e[2]*x + e[6]*y + e[10]*z + e[14]*w, e[3]*x + e[7]*y + e[11]*z + e[15]*w];
-function rayDir(camW, projInv, u, v){
+export function rayDir(camW, projInv, u, v){
   let p = mul4(projInv, u*2 - 1, 1 - v*2, 0.5, 1); p = [p[0]/p[3], p[1]/p[3], p[2]/p[3]];
   const q = mul4(camW, p[0], p[1], p[2], 1);
   const d = [q[0] - camW[12], q[1] - camW[13], q[2] - camW[14]], n = Math.hypot(...d);
   return [d[0]/n, d[1]/n, d[2]/n];
 }
-function fitLine(P){
+const median = a => { const s = [...a].sort((x, y) => x - y); return s.length ? s[s.length >> 1] : null; };
+function ransacLine(P, iters = 120, tol = 0.04){
   let best = null;
-  for (let it = 0; it < 60; it++){
+  for (let it = 0; it < iters; it++){
     const a = P[Math.random()*P.length | 0], b = P[Math.random()*P.length | 0];
     const dx = b.x - a.x, dz = b.z - a.z, len = Math.hypot(dx, dz); if (len < 0.15) continue;
-    const inl = P.filter(q => Math.abs((q.x - a.x)*dz/len - (q.z - a.z)*dx/len) < 0.04);
+    const inl = P.filter(q => Math.abs((q.x - a.x)*dz/len - (q.z - a.z)*dx/len) < tol);
     if (!best || inl.length > best.length) best = inl;
   }
-  if (!best || best.length < 5) return null;
+  if (!best || best.length < 6) return null;
   let mx = 0, mz = 0; for (const q of best){ mx += q.x; mz += q.z; } mx /= best.length; mz /= best.length;
   let sxx = 0, sxz = 0, szz = 0; for (const q of best){ const x = q.x - mx, z = q.z - mz; sxx += x*x; sxz += x*z; szz += z*z; }
   const ang = 0.5 * Math.atan2(2*sxz, sxx - szz);
-  return {mx, mz, dx: Math.cos(ang), dz: Math.sin(ang)};
+  const mc = best.reduce((s, q) => s + q.c, 0) / best.length;
+  return {mx, mz, dx: Math.cos(ang), dz: Math.sin(ang), pts: best, mc};
 }
-const median = a => { const s = [...a].sort((x, y) => x - y); return s.length ? s[s.length >> 1] : null; };
 
-// logits: Float32Array [C, Hl, Wl] (batch 1). Возвращает оценку стены в мировых координатах или {error}.
-export function estimateWall({logits, C, Hl, Wl, camW, projInv, groundY}){
+// Разбор кадра: точки стыка «стена–пол» (в мире) и лучи на стык «стена–потолок» по столбцам
+export function analyze({logits, C, Hl, Wl, camW, projInv, groundY}){
   const N = Hl * Wl, lab = new Uint8Array(N);
   for (let p = 0; p < N; p++){ let b = -1e9, bi = 0; for (let k = 0; k < C; k++){ const v = logits[k*N + p]; if (v > b){ b = v; bi = k; } } lab[p] = bi; }
   const L = (k, r, c) => logits[k*N + r*Wl + c];
-  const base = [], tops = [];
+  const cam = [camW[12], camW[13], camW[14]], pts = [], tops = {};
   for (let c = 0; c < Wl; c++){
-    // низ стены: снизу вверх через пол до первой не-пол ячейки
     let r = Hl - 1;
     while (r > Hl * 0.55 && !FLOORISH.has(lab[r*Wl + c])) r--;
     if (FLOORISH.has(lab[r*Wl + c])){
@@ -45,188 +45,225 @@ export function estimateWall({logits, C, Hl, Wl, camW, projInv, groundY}){
         const k = lab[r*Wl + c], fk = lab[(r+1)*Wl + c];
         const d0 = L(k, r, c) - L(fk, r, c), d1 = L(k, r+1, c) - L(fk, r+1, c);
         const t = d0 - d1 > 1e-6 ? Math.min(1, Math.max(0, d0 / (d0 - d1))) : 0.5;
-        base.push({c, v: (r + 0.5 + t) / Hl});
+        const d = rayDir(camW, projInv, (c + 0.5) / Wl, (r + 0.5 + t) / Hl);
+        if (d[1] < -0.02){ const s = (groundY - cam[1]) / d[1]; if (s > 0 && s < 10) pts.push({c, x: cam[0] + d[0]*s, z: cam[2] + d[2]*s}); }
       }
     }
-    // верх стены: сверху вниз через потолок
     if (lab[c] === CEIL){
       let r0 = 0; while (r0 < Hl && lab[r0*Wl + c] === CEIL) r0++;
       if (r0 < Hl - 1 && WALLISH.has(lab[r0*Wl + c])){
         const k = lab[r0*Wl + c];
         const dA = L(k, r0-1, c) - L(CEIL, r0-1, c), dB = L(k, r0, c) - L(CEIL, r0, c);
         const t = dB - dA > 1e-6 ? Math.min(1, Math.max(0, -dA / (dB - dA))) : 0.5;
-        tops[c] = (r0 - 0.5 + t) / Hl;
+        tops[c] = rayDir(camW, projInv, (c + 0.5) / Wl, (r0 - 0.5 + t) / Hl);
       }
     }
   }
-  const cam = [camW[12], camW[13], camW[14]];
-  const pts = [];
-  for (const b of base){
-    const d = rayDir(camW, projInv, (b.c + 0.5) / Wl, b.v);
-    if (d[1] > -0.02) continue;
-    const t = (groundY - cam[1]) / d[1]; if (t <= 0 || t > 10) continue;
-    pts.push({c: b.c, x: cam[0] + d[0]*t, z: cam[2] + d[2]*t});
-  }
-  const out = {lab, Hl, Wl};
-  if (pts.length < 8) return {...out, error: 'nobase'};
-  // RANSAC: прямая основания стены (отделяет фронтальную стену от боковых)
-  let best = null;
-  for (let it = 0; it < 120; it++){
-    const a = pts[Math.random()*pts.length | 0], b = pts[Math.random()*pts.length | 0];
-    const dx = b.x - a.x, dz = b.z - a.z, len = Math.hypot(dx, dz); if (len < 0.2) continue;
-    const ux = dx/len, uz = dz/len;
-    const inl = pts.filter(q => Math.abs((q.x - a.x)*uz - (q.z - a.z)*ux) < 0.04);
-    if (!best || inl.length > best.length) best = inl;
-  }
-  if (!best || best.length < 8) return {...out, error: 'noline'};
-  // самый длинный непрерывный по столбцам участок
-  best.sort((p, q) => p.c - q.c);
-  let runs = [[best[0]]];
-  for (let i = 1; i < best.length; i++){ if (best[i].c - best[i-1].c > 3) runs.push([]); runs[runs.length-1].push(best[i]); }
-  const run = runs.reduce((m, r) => r.length > m.length ? r : m);
-  if (run.length < 8) return {...out, error: 'noline'};
-  // PCA
-  let mx = 0, mz = 0; for (const q of run){ mx += q.x; mz += q.z; } mx /= run.length; mz /= run.length;
-  let sxx = 0, sxz = 0, szz = 0; for (const q of run){ const x = q.x - mx, z = q.z - mz; sxx += x*x; sxz += x*z; szz += z*z; }
-  const ang = 0.5 * Math.atan2(2*sxz, sxx - szz);
-  let dx = Math.cos(ang), dz = Math.sin(ang);
-  if (dx*camW[0] + dz*camW[2] < 0){ dx = -dx; dz = -dz; } // направление «вправо по экрану»
-  const ts = run.map(q => (q.x - mx)*dx + (q.z - mz)*dz);
-  let tMin = Math.min(...ts), tMax = Math.max(...ts), leftClosed = false, rightClosed = false;
-  // углы: точки основания соседней (боковой) стены по сторонам -> пересечение прямых.
-  // Если угол закрыт мебелью, но видна боковая стена, угол всё равно находится.
-  const inRun = new Set(run.map(q => q.c));
-  const side = (sel, isLeft) => {
-    const sp = pts.filter(q => !inRun.has(q.c) && sel(q.c));
-    if (sp.length < 5) return null;
-    const L2 = fitLine(sp); if (!L2) return null;
-    const cr = dx*L2.dz - dz*L2.dx; if (Math.abs(cr) < 0.5) return null; // угол между стенами > 30°
-    const t = ((L2.mx - mx)*L2.dz - (L2.mz - mz)*L2.dx) / cr;       // параметр пересечения на основной прямой
-    if (isLeft ? (t > tMin + 0.05 || t < tMin - 3) : (t < tMax - 0.05 || t > tMax + 3)) return null;
-    return t;
-  };
-  const c0 = run[0].c, c1 = run[run.length-1].c;
-  const tl = side(c => c < c0, true), tr = side(c => c > c1, false);
-  if (tl != null){ tMin = tl; leftClosed = true; }
-  if (tr != null){ tMax = tr; rightClosed = true; }
-  // высота: верхняя граница стены пересекается с вертикальной плоскостью стены
-  const nx = -dz, nz = dx, hs = [];
-  for (const q of run){
-    if (tops[q.c] == null) continue;
-    const d = rayDir(camW, projInv, (q.c + 0.5) / Wl, tops[q.c]);
-    const den = d[0]*nx + d[2]*nz; if (Math.abs(den) < 1e-4) continue;
-    const t = ((mx - cam[0])*nx + (mz - cam[2])*nz) / den; if (t <= 0) continue;
-    const h = cam[1] + d[1]*t - groundY;
-    if (h > 1.5 && h < 6) hs.push(h);
-  }
-  return {...out, p0: [mx, groundY, mz], dir: [dx, 0, dz], tMin, tMax, leftClosed, rightClosed,
-    h: hs.length >= 3 ? median(hs) : null, nCols: run.length};
+  return {lab, Hl, Wl, pts, tops, cam, camW};
 }
 
-// Накопление оценок между кадрами (пользователь водит телефоном)
-export function mergeWall(M, E, state, a = 0.3, maxMismatch = 3){
-  if (!M) return {p0: [...E.p0], dir: [...E.dir], tMin: E.tMin, tMax: E.tMax, leftClosed: E.leftClosed, rightClosed: E.rightClosed, hs: E.h ? [E.h] : [], h: E.h};
-  const dot = M.dir[0]*E.dir[0] + M.dir[2]*E.dir[2];
-  const ang = Math.acos(Math.min(1, Math.abs(dot)));
-  const off = Math.abs((E.p0[0] - M.p0[0])*(-M.dir[2]) + (E.p0[2] - M.p0[2])*M.dir[0]);
-  if (ang > 0.21 || off > 0.15){ state.mismatch = (state.mismatch || 0) + 1; return state.mismatch >= maxMismatch ? (state.mismatch = 0, mergeWall(null, E, state)) : M; }
-  state.mismatch = 0;
-  let {dir, tMin, tMax, leftClosed, rightClosed} = E;
-  if (dot < 0){ dir = dir.map(v => -v); [tMin, tMax] = [-tMax, -tMin]; [leftClosed, rightClosed] = [rightClosed, leftClosed]; }
-  const eA = [E.p0[0] + dir[0]*tMin, E.p0[2] + dir[2]*tMin], eB = [E.p0[0] + dir[0]*tMax, E.p0[2] + dir[2]*tMax];
-  let nd = [M.dir[0]*(1-a) + dir[0]*a, 0, M.dir[2]*(1-a) + dir[2]*a]; const nl = Math.hypot(nd[0], nd[2]); nd = [nd[0]/nl, 0, nd[2]/nl];
-  // сдвигаем точку линии к новой оценке по нормали
-  const s = (M.p0[0] - E.p0[0])*dir[0] + (M.p0[2] - E.p0[2])*dir[2];
-  const proj = [E.p0[0] + dir[0]*s, E.p0[2] + dir[2]*s];
-  const p0 = [M.p0[0]*(1-a) + proj[0]*a, E.p0[1], M.p0[2]*(1-a) + proj[1]*a];
-  const tA = (eA[0] - p0[0])*nd[0] + (eA[1] - p0[2])*nd[2], tB = (eB[0] - p0[0])*nd[0] + (eB[1] - p0[2])*nd[2];
-  const R = {...M, p0, dir: nd, hs: [...M.hs]};
-  if (leftClosed){ R.tMin = M.leftClosed ? M.tMin*(1-a) + tA*a : tA; R.leftClosed = true; } else if (!M.leftClosed) R.tMin = Math.min(M.tMin, tA);
-  if (rightClosed){ R.tMax = M.rightClosed ? M.tMax*(1-a) + tB*a : tB; R.rightClosed = true; } else if (!M.rightClosed) R.tMax = Math.max(M.tMax, tB);
-  if (E.h){ R.hs.push(E.h); if (R.hs.length > 15) R.hs.shift(); }
-  R.h = R.hs.length ? median(R.hs) : null;
-  return R;
+// Угол = пересечение двух прямых основания (фронтальная и боковая стена).
+// which: 'L' — левый угол (фронтальная стена справа от него), 'R' — правый.
+export function findCorner(A, which){
+  if (A.pts.length < 12) return {error: 'nobase'};
+  const l1 = ransacLine(A.pts); if (!l1) return {error: 'nobase'};
+  const set1 = new Set(l1.pts);
+  const l2 = ransacLine(A.pts.filter(q => !set1.has(q)));
+  if (!l2) return {error: 'nocorner'};
+  const cr = l1.dx*l2.dz - l1.dz*l2.dx;
+  if (Math.abs(cr) < 0.7) return {error: 'nocorner'};               // стены должны сходиться под углом > ~45°
+  const t = ((l2.mx - l1.mx)*l2.dz - (l2.mz - l1.mz)*l2.dx) / cr;
+  const x = l1.mx + l1.dx*t, z = l1.mz + l1.dz*t;
+  const near = l => Math.min(...l.pts.map(q => Math.hypot(q.x - x, q.z - z)));
+  if (near(l1) > 1.2 || near(l2) > 1.2) return {error: 'nocorner'}; // угол далеко от видимых стыков — ненадёжно
+  const [left, right] = l1.mc < l2.mc ? [l1, l2] : [l2, l1];
+  const front = which === 'L' ? right : left;
+  let dx = front.dx, dz = front.dz;
+  if (dx*A.camW[0] + dz*A.camW[2] < 0){ dx = -dx; dz = -dz; }      // направление вдоль стены «вправо»
+  return {x, z, dx, dz, frontCols: new Set(front.pts.map(q => q.c))};
+}
+
+// Высоты: лучи на стык с потолком пересекаются с вертикальной плоскостью стены
+export function heightsFrom(A, px, pz, dx, dz, groundY, cols){
+  const nx = -dz, nz = dx, hs = [];
+  for (const c in A.tops){
+    if (cols && !cols.has(+c)) continue;
+    const d = A.tops[c], den = d[0]*nx + d[2]*nz; if (Math.abs(den) < 1e-4) continue;
+    const t = ((px - A.cam[0])*nx + (pz - A.cam[2])*nz) / den; if (t <= 0) continue;
+    const h = A.cam[1] + d[1]*t - groundY;
+    if (h > 1.5 && h < 6) hs.push(h);
+  }
+  return hs;
+}
+
+// Высота по вертикали над точкой base (ручной режим): ближайшая точка между лучом камеры и вертикалью
+export function heightOnVertical(bx, by, bz, o, d){
+  const w0x = o[0] - bx, w0y = o[1] - by, w0z = o[2] - bz;
+  const a = d[0]*d[0] + d[1]*d[1] + d[2]*d[2], b = d[1];
+  const dd = d[0]*w0x + d[1]*w0y + d[2]*w0z, e = w0y, den = a - b*b;
+  if (den < 1e-6) return null;
+  if ((b*e - dd) / den <= 0) return null;
+  return (a*e - b*dd) / den;
 }
 
 // ---------- Браузерная часть ----------
-const S = {active: false, ready: false, loading: false, worker: null, mode: 'idle', // idle | aim | busy | done
-  gl: null, buf: null, groundY: 0, wall: null, ms: 0, status: '', merge: {}, last: null, shots: 0,
-  trk: null, prevPos: null, prevQ: null, steady: 0, pending: null};
 const STEADY_FRAMES = 12;
-let ctx = null, quad, eB, eT, eL, eR, thumb;
+const S = {active: false, ready: false, worker: null, mode: 'idle', // idle | aim | busy | wait
+  step: 'L', CL: null, CR: null, hs: [], status: '', fails: 0,
+  gl: null, buf: null, groundY: 0, ms: 0, last: null, trk: null, prevPos: null, prevQ: null, steady: 0, pending: null,
+  app: null, liveH: null,
+  cal: null};
+let ctx = null, quad, postL, postR, lineB, lineT, ring, thumb;
+const newCal = () => ({ok: false, t0: performance.now(), path: 0, last: null, ys: [], hits: [], lostSince: null, jump: 0, chk: {}});
+S.cal = newCal();
 
 export function init(c){
   ctx = c; const {THREE, group} = c;
   quad = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({color: 0x38bdf8, transparent: true, opacity: 0.3, side: THREE.DoubleSide, depthTest: false, depthWrite: false}));
   quad.renderOrder = 9; quad.visible = false; group.add(quad);
-  const bar = () => { const m = new THREE.Mesh(new THREE.CylinderGeometry(0.008, 0.008, 1, 8), new THREE.MeshBasicMaterial({color: 0x22c55e, depthTest: false})); m.renderOrder = 11; m.visible = false; group.add(m); return m; };
-  eB = bar(); eT = bar(); eL = bar(); eR = bar();
+  const bar = col => { const m = new THREE.Mesh(new THREE.CylinderGeometry(0.009, 0.009, 1, 8), new THREE.MeshBasicMaterial({color: col, depthTest: false})); m.renderOrder = 11; m.visible = false; group.add(m); return m; };
+  postL = bar(0x22c55e); postR = bar(0x22c55e); lineB = bar(0x22c55e); lineT = bar(0x22c55e);
+  ring = new THREE.Mesh(new THREE.RingGeometry(0.035, 0.05, 32).rotateX(-Math.PI/2), new THREE.MeshBasicMaterial({color: 0xffffff, depthTest: false, transparent: true, opacity: .9, side: THREE.DoubleSide}));
+  ring.renderOrder = 12; ring.visible = false; group.add(ring);
   S.prevPos = new THREE.Vector3(); S.prevQ = new THREE.Quaternion();
+  const h = document.getElementById('hint'); if (h) h.style.whiteSpace = 'pre-line';
   if (!thumb){
     thumb = document.createElement('canvas');
-    thumb.style.cssText = 'position:absolute;right:8px;top:calc(84px + env(safe-area-inset-top));width:64px;border:1px solid #fff6;border-radius:4px;image-rendering:pixelated;pointer-events:none;display:none';
+    thumb.style.cssText = 'position:absolute;right:8px;top:calc(110px + env(safe-area-inset-top));width:64px;border:1px solid #fff6;border-radius:4px;image-rendering:pixelated;pointer-events:none;display:none';
     document.getElementById('hud').appendChild(thumb);
   }
 }
 export const setGround = y => { S.groundY = y; };
-export const canSave = () => !!(S.wall && S.wall.h && S.wall.tMax - S.wall.tMin > 0.3);
-export const info = () => S.ms ? `нейросеть ${S.ms} мс` : '';
-const bar = n => '▮'.repeat(n) + '▯'.repeat(5 - n);
-export function hint(){
-  const M = S.wall;
-  if (!S.ready) return S.status || 'Загрузка нейросети…';
-  if (S.mode === 'busy') return 'Анализ кадра… можно двигаться';
-  if (S.mode === 'aim'){
-    if (S.trk && S.trk !== 'NORMAL') return 'Поводите телефоном по полу, пока трекинг не станет NORMAL';
-    return (M ? 'Ещё кадр: ' : '') + 'наведите на стену (виден стык с полом) и замрите ' + bar(Math.min(5, Math.round(S.steady / STEADY_FRAMES * 5)));
+export const isCalibrated = () => S.cal.ok;
+
+// ---------- Обязательная калибровка ----------
+// Пройдена, когда: трекинг NORMAL >= 4 с, телефон прошёл >= 1 м, пол найден и стабилен (разброс < 1.5 см),
+// высота телефона над полом правдоподобна (0.8–2.1 м — проверка абсолютного масштаба).
+export function calibUpdate(cam, st){
+  S.app = st;
+  const C = S.cal, now = performance.now();
+  const trkOk = String(st.tracking || '').startsWith('NORMAL');
+  const floorHit = st.hit && (st.hitType === 'DETECTED_SURFACE' || st.hitType === 'ESTIMATED_SURFACE' || st.hitType === 'plane');
+  const e = cam.matrixWorld.elements, pos = [e[12], e[13], e[14]];
+  if (C.ok){
+    if (!trkOk){ C.lostSince ??= now; if (now - C.lostSince > 1500) recalibrate('Трекинг потерян — пройдите калибровку заново'); }
+    else C.lostSince = null;
+    if (floorHit && Math.abs(st.hit.y - C.floorY) > 0.05){ if (++C.jump > 30) recalibrate('Пол сместился — нужна новая калибровка'); } else C.jump = 0;
+    return C.ok;
   }
-  if (!M) return (S.status ? S.status + '. ' : '') + 'Коснитесь экрана, чтобы снять заново';
-  const miss = [];
-  if (!M.h) miss.push('потолок');
-  if (!M.leftClosed) miss.push('левый угол');
-  if (!M.rightClosed) miss.push('правый угол');
-  if (miss.length) return (S.status ? S.status + '. ' : '') + 'Не найдено: ' + miss.join(', ') + '. Наведите туда и коснитесь экрана';
-  return 'Стена найдена — нажмите ✓ (↶ — заново)';
+  if (!trkOk){ Object.assign(C, newCal(), {chk: {trk: false}}); return false; }
+  if (C.last){ const d = Math.hypot(pos[0] - C.last[0], pos[1] - C.last[1], pos[2] - C.last[2]); if (d < 0.2) C.path += d; }
+  C.last = pos;
+  C.hits.push(floorHit ? 1 : 0); if (C.hits.length > 90) C.hits.shift();
+  if (floorHit){ C.ys.push(st.hit.y); if (C.ys.length > 60) C.ys.shift(); }
+  const rate = C.hits.reduce((a, b) => a + b, 0) / C.hits.length;
+  const fy = median(C.ys) ?? 0, mean = C.ys.reduce((a, b) => a + b, 0) / (C.ys.length || 1);
+  const sd = Math.sqrt(C.ys.reduce((a, b) => a + (b - mean)**2, 0) / (C.ys.length || 1));
+  const camH = pos[1] - fy;
+  C.chk = {trk: true, time: (now - C.t0) / 1000, path: C.path, floor: C.ys.length >= 30 && rate >= 0.5 && sd < 0.015, camH};
+  if (C.chk.time >= 4 && C.path >= 1.0 && C.chk.floor && camH > 0.8 && camH < 2.1){
+    C.ok = true; C.floorY = fy; S.groundY = fy; S.status = '';
+    if (navigator.vibrate) navigator.vibrate([30, 60, 30]);
+  }
+  return C.ok;
 }
-export function reset(){ S.wall = null; S.merge = {}; S.status = ''; S.shots = 0; S.mode = S.ready ? 'aim' : 'idle'; S.steady = 0; }
-export function tap(){ if (S.ready && S.mode !== 'busy'){ S.mode = 'aim'; S.steady = 0; S.status = ''; } }
+export function recalibrate(msg){
+  S.cal = newCal(); S.cal.msg = msg || '';
+  resetWall();
+}
+function calibHint(){
+  const c = S.cal.chk, ok = b => b ? '✓' : '○';
+  const lines = ['КАЛИБРОВКА (обязательно)' + (S.cal.msg ? ': ' + S.cal.msg : '')];
+  if (!c.trk){ lines.push('○ Медленно водите телефоном по полу'); return lines.join('\n'); }
+  lines.push(ok(c.floor) + ' Пол найден и стабилен' + (c.floor ? '' : ' — смотрите на пол'));
+  lines.push(ok(c.path >= 1) + ' Пройдите с телефоном ~1 м: ' + Math.min(1, c.path).toFixed(2) + ' / 1.00 м');
+  const hOk = c.camH > 0.8 && c.camH < 2.1;
+  lines.push(ok(hOk) + ' Высота телефона над полом: ' + (c.floor ? c.camH.toFixed(2) + ' м' : '—') + (c.floor && !hOk ? ' (неправдоподобно — сбросьте ⟲)' : ''));
+  lines.push(ok(c.time >= 4) + ' Время: ' + Math.min(4, c.time).toFixed(0) + ' / 4 с');
+  return lines.join('\n');
+}
+
+// ---------- Пошаговый замер по краям ----------
+const STEP_TEXT = {
+  L: 'ЛЕВЫЙ УГОЛ: наведите на левый угол стены так, чтобы у пола были видны обе стены',
+  R: 'ПРАВЫЙ УГОЛ: наведите на правый угол так, чтобы у пола были видны обе стены',
+  H: 'ПОТОЛОК: наведите на верх стены, чтобы был виден стык с потолком',
+};
+const ERR = {nobase: 'Не вижу стык стены с полом', nocorner: 'Угол не найден — нужны обе стены у пола', noheight: 'Стык с потолком не найден', mismatch: 'Правый угол не на одной линии с левым — переснимите'};
+function resetWall(){ S.step = 'L'; S.CL = S.CR = null; S.hs = []; S.status = ''; S.fails = 0; S.mode = S.ready ? 'aim' : 'idle'; S.steady = 0; S.pending = null; }
+export function reset(){ resetWall(); }
+export function tap(){ if (S.cal.ok && S.ready && S.mode !== 'busy' && S.step !== 'done'){ S.mode = 'aim'; S.steady = 0; S.status = ''; } }
 export function setActive(on){
   S.active = on;
   if (thumb) thumb.style.display = on && S.last ? 'block' : 'none';
-  if (!on) [quad, eB, eT, eL, eR].forEach(o => o && (o.visible = false));
-  if (on){ load(); if (S.ready && S.mode !== 'busy' && !S.wall){ S.mode = 'aim'; S.steady = 0; } }
+  if (!on) [quad, postL, postR, lineB, lineT, ring].forEach(o => o && (o.visible = false));
+  if (on){ load(); if (S.ready && S.mode === 'idle') S.mode = 'aim'; }
 }
+export const info = () => !S.cal.ok ? 'калибровка' : S.ms ? `нейросеть ${S.ms} мс` : '';
+const meter = n => '▮'.repeat(n) + '▯'.repeat(5 - n);
+const H = () => S.hs.length >= 5 ? median(S.hs) : null;
+export function hint(){
+  if (!S.cal.ok) return calibHint();
+  if (!S.ready) return S.status || 'Загрузка нейросети…';
+  const done = [S.CL ? '✓ лев. угол' : '○ лев. угол', S.CR ? '✓ прав. угол' : '○ прав. угол', H() ? '✓ потолок' : '○ потолок'].join('  ');
+  if (S.step === 'done') return done + '\nСтена измерена — нажмите ✓ (↶ — заново)';
+  let line = STEP_TEXT[S.step];
+  if (S.mode === 'busy') line = 'Анализ кадра… можно двигаться';
+  else if (S.mode === 'aim') line += '\nЗамрите ' + meter(Math.min(5, Math.round(S.steady / STEADY_FRAMES * 5)));
+  else if (S.status) line = S.status + '\nКоснитесь экрана — снять ещё раз' + (S.step === 'H' ? '' : ', или наведите крестик на угол у пола и нажмите ✓');
+  if (S.step === 'H' && S.mode !== 'busy') line += '\n(или наведите крестик на линию потолка над углом и нажмите ✓)';
+  return done + '\n' + line;
+}
+export function canSave(){
+  if (!S.cal.ok) return false;
+  if (S.step === 'done') return true;
+  if (S.mode === 'busy') return false;
+  if (S.step === 'L' || S.step === 'R') return !!(S.app && S.app.hit);
+  if (S.step === 'H') return S.liveH > 0.5;
+  return false;
+}
+function nextStep(){
+  if (!S.CL) S.step = 'L'; else if (!S.CR) S.step = 'R'; else if (!H()) S.step = 'H'; else S.step = 'done';
+  S.mode = S.step === 'done' ? 'wait' : 'aim'; S.steady = 0; S.fails = 0;
+}
+function acceptCorner(K){
+  if (S.step === 'R' && S.CL && S.CL.dx != null && K.dx != null){
+    const ang = Math.acos(Math.min(1, Math.abs(S.CL.dx*K.dx + S.CL.dz*K.dz)));
+    const off = Math.abs((K.x - S.CL.x)*(-S.CL.dz) + (K.z - S.CL.z)*S.CL.dx);
+    if (ang > 0.2 || off > 0.12) return false;
+  }
+  S['C' + S.step] = K; return true;
+}
+
 function load(){
   if (S.worker) return;
   S.status = 'Загрузка нейросети…';
-  try {
-    S.worker = new Worker(new URL('./segworker.js', import.meta.url), {type: 'module'});
-  } catch (e){ S.status = 'Браузер не поддерживает фоновые потоки: ' + (e.message || e); return; }
+  try { S.worker = new Worker(new URL('./segworker.js', import.meta.url), {type: 'module'}); }
+  catch (e){ S.status = 'Браузер не поддерживает фоновые потоки: ' + (e.message || e); return; }
   S.worker.onmessage = ({data: m}) => {
     if (m.type === 'progress') S.status = 'Загрузка нейросети… ' + m.pct + '%';
     else if (m.type === 'ready'){ S.ready = true; S.status = ''; if (S.mode === 'idle') S.mode = 'aim'; }
     else if (m.type === 'result') onResult(m);
-    else if (m.type === 'error'){ S.status = 'Ошибка нейросети: ' + m.message; if (S.mode === 'busy') S.mode = 'done'; }
+    else if (m.type === 'error'){ S.status = 'Ошибка нейросети: ' + m.message; if (S.mode === 'busy') S.mode = 'wait'; }
   };
   S.worker.onerror = e => { S.status = 'Не удалось запустить нейросеть: ' + (e.message || 'ошибка загрузки'); };
   S.worker.postMessage({type: 'load'});
 }
 
-// Модуль 8th Wall: ставится сразу после GlTextureRenderer; ждёт неподвижный кадр с хорошим трекингом
+// Модуль 8th Wall: сразу после GlTextureRenderer; снимает кадр, когда телефон неподвижен и трекинг NORMAL
 export function grabModule(getCam){
   return {
     name: 'wall-grab',
     onStart: ({GLctx}) => { S.gl = GLctx; },
     onRender: () => {
-      if (!S.active || S.mode !== 'aim' || !S.ready) return;
+      if (!S.active || !S.cal.ok || S.mode !== 'aim' || !S.ready || S.step === 'done') return;
       const cam = getCam(); if (!cam || !S.prevPos) return;
       cam.updateMatrixWorld();
       const pos = new cam.position.constructor().setFromMatrixPosition(cam.matrixWorld);
       const q = new cam.quaternion.constructor().setFromRotationMatrix(cam.matrixWorld);
       const still = pos.distanceTo(S.prevPos) < 0.004 && q.angleTo(S.prevQ) < 0.006;
       S.prevPos.copy(pos); S.prevQ.copy(q);
-      const trackingOk = !S.trk || S.trk === 'NORMAL';
-      S.steady = still && trackingOk ? S.steady + 1 : 0;
+      S.steady = still && (!S.trk || S.trk === 'NORMAL') ? S.steady + 1 : 0;
       if (S.steady >= STEADY_FRAMES){ S.steady = 0; capture(cam); }
     },
     listeners: [{event: 'reality.trackingstatus', process: ({detail}) => { S.trk = detail.status; }}],
@@ -244,38 +281,47 @@ function capture(cam){
   const projInv = Array.from(cam.projectionMatrix.clone().invert().elements);
   const portrait = h >= w, Lg = 512;
   const Sh = Math.max(224, Math.round(Lg * Math.min(w, h) / Math.max(w, h) / 32) * 32);
-  const W = portrait ? Sh : Lg, H = portrait ? Lg : Sh;
-  const data = new Float32Array(3*W*H), mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225];
-  for (let y = 0; y < H; y++){
-    const sy = h - 1 - Math.min(h - 1, Math.floor((y + 0.5) * h / H));
+  const W = portrait ? Sh : Lg, Hh = portrait ? Lg : Sh;
+  const data = new Float32Array(3*W*Hh), mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225];
+  for (let y = 0; y < Hh; y++){
+    const sy = h - 1 - Math.min(h - 1, Math.floor((y + 0.5) * h / Hh));
     for (let x = 0; x < W; x++){
       const sx = Math.min(w - 1, Math.floor((x + 0.5) * w / W)), i = (sy*w + sx)*4, o = y*W + x;
       data[o] = (S.buf[i]/255 - mean[0]) / std[0];
-      data[W*H + o] = (S.buf[i+1]/255 - mean[1]) / std[1];
-      data[2*W*H + o] = (S.buf[i+2]/255 - mean[2]) / std[2];
+      data[W*Hh + o] = (S.buf[i+1]/255 - mean[1]) / std[1];
+      data[2*W*Hh + o] = (S.buf[i+2]/255 - mean[2]) / std[2];
     }
   }
   const id = Date.now();
-  S.pending = {id, camW, projInv, groundY: S.groundY};
+  S.pending = {id, camW, projInv, groundY: S.groundY, step: S.step};
   S.mode = 'busy';
   if (navigator.vibrate) navigator.vibrate(20);
-  S.worker.postMessage({type: 'run', id, data, H, W}, [data.buffer]);
+  S.worker.postMessage({type: 'run', id, data, H: Hh, W}, [data.buffer]);
 }
 function onResult(m){
   const P = S.pending; if (!P || P.id !== m.id) return;
   S.pending = null; S.ms = m.ms;
+  if (P.step !== S.step){ S.mode = 'aim'; return; } // пользователь успел сменить шаг
   const [, C, Hl, Wl] = m.dims;
-  const E = estimateWall({logits: m.logits, C, Hl, Wl, camW: P.camW, projInv: P.projInv, groundY: P.groundY});
-  S.last = E; drawThumb(E); S.mode = 'done';
-  if (E.error){ S.status = E.error === 'nobase' ? 'Не видно стыка стены с полом' : 'Стена не распознана'; return; }
-  const before = S.wall;
-  S.wall = mergeWall(S.wall, E, S.merge, 1 / (S.shots + 1), 2);
-  if (before && S.wall === before) S.status = 'Похоже, это другая стена (↶ — начать заново)';
-  else { S.status = ''; S.shots++; }
+  const A = analyze({logits: m.logits, C, Hl, Wl, camW: P.camW, projInv: P.projInv, groundY: P.groundY});
+  S.last = A; drawThumb(A);
+  const fail = code => { S.status = ERR[code]; S.mode = 'wait'; S.fails++; };
+  if (S.step === 'L' || S.step === 'R'){
+    const K = findCorner(A, S.step);
+    if (K.error) return fail(K.error);
+    if (!acceptCorner(K)) return fail('mismatch');
+    S.hs.push(...heightsFrom(A, K.x, K.z, K.dx, K.dz, P.groundY, K.frontCols));
+  } else if (S.step === 'H'){
+    const dx = S.CR.x - S.CL.x, dz = S.CR.z - S.CL.z, l = Math.hypot(dx, dz);
+    const hs = heightsFrom(A, S.CL.x, S.CL.z, dx/l, dz/l, P.groundY, null);
+    if (hs.length < 5) return fail('noheight');
+    S.hs.push(...hs);
+  }
+  S.status = ''; nextStep();
 }
-function drawThumb(E){
-  if (!thumb || !E.lab) return;
-  const {lab, Wl, Hl} = E; thumb.width = Wl; thumb.height = Hl;
+function drawThumb(A){
+  if (!thumb || !A.lab) return;
+  const {lab, Wl, Hl} = A; thumb.width = Wl; thumb.height = Hl;
   const c2 = thumb.getContext('2d'), img = c2.createImageData(Wl, Hl);
   for (let p = 0; p < Wl*Hl; p++){
     const k = lab[p];
@@ -285,30 +331,56 @@ function drawThumb(E){
   c2.putImageData(img, 0, 0); thumb.style.display = S.active ? 'block' : 'none';
 }
 
-// Каждый кадр: только отрисовка закреплённой стены (без нейросети)
+// Каждый кадр: отрисовка закреплённых краёв (нейросеть не участвует)
 export function update(cam){
-  const {THREE, setBar, placeLabel, labW, labH, cm} = ctx, M = S.wall;
-  [quad, eB, eT, eL, eR].forEach(o => o.visible = false);
+  const {THREE, setBar, placeLabel, labW, labH, cm} = ctx;
+  [quad, postL, postR, lineB, lineT, ring].forEach(o => o.visible = false);
   labW.classList.add('hidden'); labH.classList.add('hidden');
-  if (!S.active || !M) return;
-  const V = THREE.Vector3, H = M.h || 2.5, gy = M.p0[1];
-  const dir = new V(M.dir[0], 0, M.dir[2]), p0 = new V(...M.p0);
-  const A = p0.clone().addScaledVector(dir, M.tMin), B = p0.clone().addScaledVector(dir, M.tMax);
-  const At = A.clone(), Bt = B.clone(); At.y = Bt.y = gy + H;
-  const n = new V(-dir.z, 0, dir.x);
-  quad.position.addVectors(A, Bt).multiplyScalar(0.5);
-  quad.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(dir, new V(0, 1, 0), n));
-  quad.scale.set(M.tMax - M.tMin, H, 1); quad.material.opacity = M.h ? 0.3 : 0.15; quad.visible = true;
-  const col = (m, ok) => m.material.color.setHex(ok ? 0x22c55e : 0xf97316);
-  col(eB, true); col(eT, !!M.h); col(eL, M.leftClosed); col(eR, M.rightClosed);
-  setBar(eB, A, B); setBar(eT, At, Bt); setBar(eL, A, At); setBar(eR, B, Bt);
-  placeLabel(labW, new V().addVectors(A, B).multiplyScalar(0.5), cam, 'Ш ' + cm(M.tMax - M.tMin) + (M.leftClosed && M.rightClosed ? '' : ' …'));
-  placeLabel(labH, new V(B.x, gy + H/2, B.z), cam, M.h ? 'В ' + cm(M.h) : 'В ?');
+  if (!S.active || !S.cal.ok) return;
+  const V = THREE.Vector3, gy = S.groundY, hh = H(), top = gy + (hh || 2.5);
+  const e = cam.matrixWorld.elements, o = [e[12], e[13], e[14]];
+  const d = new V(0, 0, -1).transformDirection(cam.matrixWorld);
+  // прицел на полу для ручного угла
+  if ((S.step === 'L' || S.step === 'R') && S.app && S.app.hit && S.mode !== 'busy'){ ring.position.copy(S.app.hit); ring.visible = true; }
+  const post = (m, K) => { const a = new V(K.x, gy, K.z), b = new V(K.x, top, K.z); setBar(m, a, b); return a; };
+  const A = S.CL && post(postL, S.CL), B = S.CR && post(postR, S.CR);
+  // живая высота для ручного шага «потолок»
+  S.liveH = null;
+  if (S.step === 'H' && S.CL){
+    const base = S.CR || S.CL;
+    S.liveH = heightOnVertical(base.x, gy, base.z, o, [d.x, d.y, d.z]);
+    if (S.liveH > 0.5) placeLabel(labH, new V(base.x, gy + S.liveH/2, base.z), cam, 'В ' + cm(S.liveH));
+  }
+  if (A && B){
+    setBar(lineB, A, B);
+    const At = A.clone(), Bt = B.clone(); At.y = Bt.y = top;
+    if (hh) setBar(lineT, At, Bt);
+    const dir = B.clone().sub(A).setY(0).normalize();
+    quad.position.addVectors(A, Bt).multiplyScalar(0.5);
+    quad.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(dir, new V(0, 1, 0), new V(-dir.z, 0, dir.x)));
+    quad.scale.set(Math.hypot(B.x - A.x, B.z - A.z), top - gy, 1); quad.material.opacity = hh ? 0.3 : 0.12; quad.visible = true;
+    placeLabel(labW, new V().addVectors(A, B).multiplyScalar(0.5), cam, 'Ш ' + cm(Math.hypot(B.x - A.x, B.z - A.z)));
+    if (hh) placeLabel(labH, new V(B.x, gy + hh/2, B.z), cam, 'В ' + cm(hh));
+  }
 }
+// Кнопка ✓: сохранить готовую стену или поставить текущий край вручную по прицелу
 export function save(addMeasurement, toast){
-  const M = S.wall; if (!canSave()) return;
-  const w = M.tMax - M.tMin;
-  addMeasurement({type: 'wall', w, h: M.h, engine: '8thwall-auto'});
-  toast('Стена сохранена: ' + (w*100).toFixed(1) + ' × ' + (M.h*100).toFixed(1) + ' см' + (M.leftClosed && M.rightClosed ? '' : ' (углы не найдены — ширина может быть занижена)'));
-  reset();
+  if (!canSave()) return;
+  if (S.step === 'done'){
+    const w = Math.hypot(S.CR.x - S.CL.x, S.CR.z - S.CL.z), h = H();
+    addMeasurement({type: 'wall', w, h, engine: '8thwall-auto'});
+    toast('Стена сохранена: ' + (w*100).toFixed(1) + ' × ' + (h*100).toFixed(1) + ' см');
+    resetWall(); return;
+  }
+  if (S.step === 'L' || S.step === 'R'){
+    const p = S.app.hit, other = S.step === 'L' ? S.CR : S.CL;
+    let dx = null, dz = null;
+    if (other){ dx = (S.step === 'L' ? other.x - p.x : p.x - other.x); dz = (S.step === 'L' ? other.z - p.z : p.z - other.z); const l = Math.hypot(dx, dz); dx /= l; dz /= l; }
+    S['C' + S.step] = {x: p.x, z: p.z, dx, dz, manual: true};
+    toast((S.step === 'L' ? 'Левый' : 'Правый') + ' угол поставлен вручную');
+  } else if (S.step === 'H'){
+    for (let i = 0; i < 5; i++) S.hs.push(S.liveH);
+    toast('Высота поставлена вручную');
+  }
+  S.status = ''; nextStep();
 }
