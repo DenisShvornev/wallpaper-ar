@@ -144,6 +144,7 @@ import * as THREE from 'three';
 import {heightOnVertical, calcRolls} from './geom.js?v=6';
 import {Calibration} from './calib.js?v=6';
 import * as Auto from './wallseg.js?v=6';
+window.THREE = THREE;   // нужен XR8.Threejs.pipelineModule()
 
 const $ = id => document.getElementById(id);
 const V3 = THREE.Vector3;
