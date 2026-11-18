@@ -1,7 +1,6 @@
 // Авто-определение стены: SegFormer-B0 (ADE20K) в браузере + геометрия по плоскости пола из SLAM.
-// Модель: Xenova/segformer-b0-finetuned-ade-512-512 (4.4 МБ, q8), запуск через Transformers.js (WASM).
-const SEG_MODEL = 'Xenova/segformer-b0-finetuned-ade-512-512';
-const TJS_URL = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1';
+// Модель: Xenova/segformer-b0-finetuned-ade-512-512 (4.4 МБ, q8), Transformers.js в фоновом потоке (segworker.js).
+// Нейросеть запускается только на «хороших» кадрах: телефон неподвижен, трекинг NORMAL. Результат закрепляется в мире AR.
 export const WALL = 0, CEIL = 5;
 export const WALLISH = new Set([0, 1, 8, 14, 18, 22, 25, 27]); // wall, building, windowpane, door, curtain, painting, house, mirror
 export const FLOORISH = new Set([3, 6, 11, 13, 28]);           // floor, road, sidewalk, earth, rug
@@ -125,17 +124,16 @@ export function estimateWall({logits, C, Hl, Wl, camW, projInv, groundY}){
 }
 
 // Накопление оценок между кадрами (пользователь водит телефоном)
-export function mergeWall(M, E, state){
+export function mergeWall(M, E, state, a = 0.3, maxMismatch = 3){
   if (!M) return {p0: [...E.p0], dir: [...E.dir], tMin: E.tMin, tMax: E.tMax, leftClosed: E.leftClosed, rightClosed: E.rightClosed, hs: E.h ? [E.h] : [], h: E.h};
   const dot = M.dir[0]*E.dir[0] + M.dir[2]*E.dir[2];
   const ang = Math.acos(Math.min(1, Math.abs(dot)));
   const off = Math.abs((E.p0[0] - M.p0[0])*(-M.dir[2]) + (E.p0[2] - M.p0[2])*M.dir[0]);
-  if (ang > 0.21 || off > 0.15){ state.mismatch = (state.mismatch || 0) + 1; return state.mismatch >= 3 ? (state.mismatch = 0, mergeWall(null, E, state)) : M; }
+  if (ang > 0.21 || off > 0.15){ state.mismatch = (state.mismatch || 0) + 1; return state.mismatch >= maxMismatch ? (state.mismatch = 0, mergeWall(null, E, state)) : M; }
   state.mismatch = 0;
   let {dir, tMin, tMax, leftClosed, rightClosed} = E;
   if (dot < 0){ dir = dir.map(v => -v); [tMin, tMax] = [-tMax, -tMin]; [leftClosed, rightClosed] = [rightClosed, leftClosed]; }
   const eA = [E.p0[0] + dir[0]*tMin, E.p0[2] + dir[2]*tMin], eB = [E.p0[0] + dir[0]*tMax, E.p0[2] + dir[2]*tMax];
-  const a = 0.3;
   let nd = [M.dir[0]*(1-a) + dir[0]*a, 0, M.dir[2]*(1-a) + dir[2]*a]; const nl = Math.hypot(nd[0], nd[2]); nd = [nd[0]/nl, 0, nd[2]/nl];
   // сдвигаем точку линии к новой оценке по нормали
   const s = (M.p0[0] - E.p0[0])*dir[0] + (M.p0[2] - E.p0[2])*dir[2];
@@ -151,8 +149,10 @@ export function mergeWall(M, E, state){
 }
 
 // ---------- Браузерная часть ----------
-const S = {active: false, model: null, T: null, loading: false, busy: false, want: false, gl: null, buf: null,
-  groundY: 0, wall: null, ms: 0, status: '', merge: {}, last: null};
+const S = {active: false, ready: false, loading: false, worker: null, mode: 'idle', // idle | aim | busy | done
+  gl: null, buf: null, groundY: 0, wall: null, ms: 0, status: '', merge: {}, last: null, shots: 0,
+  trk: null, prevPos: null, prevQ: null, steady: 0, pending: null};
+const STEADY_FRAMES = 12;
 let ctx = null, quad, eB, eT, eL, eR, thumb;
 
 export function init(c){
@@ -161,6 +161,7 @@ export function init(c){
   quad.renderOrder = 9; quad.visible = false; group.add(quad);
   const bar = () => { const m = new THREE.Mesh(new THREE.CylinderGeometry(0.008, 0.008, 1, 8), new THREE.MeshBasicMaterial({color: 0x22c55e, depthTest: false})); m.renderOrder = 11; m.visible = false; group.add(m); return m; };
   eB = bar(); eT = bar(); eL = bar(); eR = bar();
+  S.prevPos = new THREE.Vector3(); S.prevQ = new THREE.Quaternion();
   if (!thumb){
     thumb = document.createElement('canvas');
     thumb.style.cssText = 'position:absolute;right:8px;top:calc(84px + env(safe-area-inset-top));width:64px;border:1px solid #fff6;border-radius:4px;image-rendering:pixelated;pointer-events:none;display:none';
@@ -169,56 +170,78 @@ export function init(c){
 }
 export const setGround = y => { S.groundY = y; };
 export const canSave = () => !!(S.wall && S.wall.h && S.wall.tMax - S.wall.tMin > 0.3);
-export const info = () => S.model ? `нейросеть ${S.ms} мс` : '';
+export const info = () => S.ms ? `нейросеть ${S.ms} мс` : '';
+const bar = n => '▮'.repeat(n) + '▯'.repeat(5 - n);
 export function hint(){
   const M = S.wall;
-  if (!S.model) return S.status || 'Загрузка нейросети…';
-  if (!M) return S.status || 'Наведите на стену так, чтобы был виден стык с полом';
-  if (!M.h) return 'Поднимите телефон, чтобы был виден потолок';
-  if (!(M.leftClosed && M.rightClosed)) return 'Поведите телефоном к углам стены';
-  return 'Стена найдена — нажмите ✓ (или ↶ для сброса)';
+  if (!S.ready) return S.status || 'Загрузка нейросети…';
+  if (S.mode === 'busy') return 'Анализ кадра… можно двигаться';
+  if (S.mode === 'aim'){
+    if (S.trk && S.trk !== 'NORMAL') return 'Поводите телефоном по полу, пока трекинг не станет NORMAL';
+    return (M ? 'Ещё кадр: ' : '') + 'наведите на стену (виден стык с полом) и замрите ' + bar(Math.min(5, Math.round(S.steady / STEADY_FRAMES * 5)));
+  }
+  if (!M) return (S.status ? S.status + '. ' : '') + 'Коснитесь экрана, чтобы снять заново';
+  const miss = [];
+  if (!M.h) miss.push('потолок');
+  if (!M.leftClosed) miss.push('левый угол');
+  if (!M.rightClosed) miss.push('правый угол');
+  if (miss.length) return (S.status ? S.status + '. ' : '') + 'Не найдено: ' + miss.join(', ') + '. Наведите туда и коснитесь экрана';
+  return 'Стена найдена — нажмите ✓ (↶ — заново)';
 }
-export function reset(){ S.wall = null; S.merge = {}; S.status = ''; }
+export function reset(){ S.wall = null; S.merge = {}; S.status = ''; S.shots = 0; S.mode = S.ready ? 'aim' : 'idle'; S.steady = 0; }
+export function tap(){ if (S.ready && S.mode !== 'busy'){ S.mode = 'aim'; S.steady = 0; S.status = ''; } }
 export function setActive(on){
-  S.active = on; S.want = on;
+  S.active = on;
   if (thumb) thumb.style.display = on && S.last ? 'block' : 'none';
   if (!on) [quad, eB, eT, eL, eR].forEach(o => o && (o.visible = false));
-  if (on) load();
+  if (on){ load(); if (S.ready && S.mode !== 'busy' && !S.wall){ S.mode = 'aim'; S.steady = 0; } }
 }
-async function load(){
-  if (S.model || S.loading) return;
-  S.loading = true; S.status = 'Загрузка нейросети…';
+function load(){
+  if (S.worker) return;
+  S.status = 'Загрузка нейросети…';
   try {
-    const T = await import(TJS_URL); T.env.allowLocalModels = false; S.T = T;
-    const files = {};
-    S.model = await T.AutoModel.from_pretrained(SEG_MODEL, {dtype: 'q8', device: 'wasm', progress_callback: p => {
-      if (p.status === 'progress' && p.total){ files[p.file] = [p.loaded, p.total]; let l = 0, t = 0; for (const k in files){ l += files[k][0]; t += files[k][1]; } S.status = 'Загрузка нейросети… ' + Math.round(l / t * 100) + '%'; }
-    }});
-    S.status = '';
-  } catch (e){ S.status = 'Не удалось загрузить нейросеть: ' + (e.message || e); }
-  S.loading = false;
+    S.worker = new Worker(new URL('./segworker.js', import.meta.url), {type: 'module'});
+  } catch (e){ S.status = 'Браузер не поддерживает фоновые потоки: ' + (e.message || e); return; }
+  S.worker.onmessage = ({data: m}) => {
+    if (m.type === 'progress') S.status = 'Загрузка нейросети… ' + m.pct + '%';
+    else if (m.type === 'ready'){ S.ready = true; S.status = ''; if (S.mode === 'idle') S.mode = 'aim'; }
+    else if (m.type === 'result') onResult(m);
+    else if (m.type === 'error'){ S.status = 'Ошибка нейросети: ' + m.message; if (S.mode === 'busy') S.mode = 'done'; }
+  };
+  S.worker.onerror = e => { S.status = 'Не удалось запустить нейросеть: ' + (e.message || 'ошибка загрузки'); };
+  S.worker.postMessage({type: 'load'});
 }
 
-// Модуль 8th Wall: ставится сразу после GlTextureRenderer, читает кадр камеры до отрисовки 3D-объектов
+// Модуль 8th Wall: ставится сразу после GlTextureRenderer; ждёт неподвижный кадр с хорошим трекингом
 export function grabModule(getCam){
   return {
     name: 'wall-grab',
     onStart: ({GLctx}) => { S.gl = GLctx; },
-    onRender: () => { if (S.active && S.want && !S.busy && S.model) grab(getCam()); },
+    onRender: () => {
+      if (!S.active || S.mode !== 'aim' || !S.ready) return;
+      const cam = getCam(); if (!cam || !S.prevPos) return;
+      cam.updateMatrixWorld();
+      const pos = new cam.position.constructor().setFromMatrixPosition(cam.matrixWorld);
+      const q = new cam.quaternion.constructor().setFromRotationMatrix(cam.matrixWorld);
+      const still = pos.distanceTo(S.prevPos) < 0.004 && q.angleTo(S.prevQ) < 0.006;
+      S.prevPos.copy(pos); S.prevQ.copy(q);
+      const trackingOk = !S.trk || S.trk === 'NORMAL';
+      S.steady = still && trackingOk ? S.steady + 1 : 0;
+      if (S.steady >= STEADY_FRAMES){ S.steady = 0; capture(cam); }
+    },
+    listeners: [{event: 'reality.trackingstatus', process: ({detail}) => { S.trk = detail.status; }}],
   };
 }
-function grab(cam){
-  const gl = S.gl; if (!gl || !cam) return;
+function capture(cam){
+  const gl = S.gl; if (!gl) return;
   const w = gl.drawingBufferWidth, h = gl.drawingBufferHeight;
   const prev = gl.getParameter(gl.FRAMEBUFFER_BINDING);
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   if (!S.buf || S.buf.length !== w*h*4) S.buf = new Uint8Array(w*h*4);
   gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, S.buf);
   gl.bindFramebuffer(gl.FRAMEBUFFER, prev);
-  cam.updateMatrixWorld();
   const camW = Array.from(cam.matrixWorld.elements);
   const projInv = Array.from(cam.projectionMatrix.clone().invert().elements);
-  // подготовка тензора — синхронно, пока буфер не перезаписан
   const portrait = h >= w, Lg = 512;
   const Sh = Math.max(224, Math.round(Lg * Math.min(w, h) / Math.max(w, h) / 32) * 32);
   const W = portrait ? Sh : Lg, H = portrait ? Lg : Sh;
@@ -232,20 +255,23 @@ function grab(cam){
       data[2*W*H + o] = (S.buf[i+2]/255 - mean[2]) / std[2];
     }
   }
-  S.busy = true; S.want = false;
-  const groundY = S.groundY;
-  (async () => {
-    const t0 = performance.now();
-    const out = await S.model({pixel_values: new S.T.Tensor('float32', data, [1, 3, H, W])});
-    S.ms = Math.round(performance.now() - t0);
-    const [, C, Hl, Wl] = out.logits.dims;
-    const E = estimateWall({logits: out.logits.data, C, Hl, Wl, camW, projInv, groundY});
-    S.last = E; drawThumb(E);
-    if (E.error){ S.status = E.error === 'nobase' ? 'Не вижу стык стены с полом — отойдите и наведите на низ стены' : 'Стена не распознана — наведите прямо на неё'; return; }
-    S.status = '';
-    S.wall = mergeWall(S.wall, E, S.merge);
-  })().catch(e => { S.status = 'Ошибка нейросети: ' + (e.message || e); })
-     .finally(() => { S.busy = false; if (S.active) setTimeout(() => { S.want = true; }, 120); });
+  const id = Date.now();
+  S.pending = {id, camW, projInv, groundY: S.groundY};
+  S.mode = 'busy';
+  if (navigator.vibrate) navigator.vibrate(20);
+  S.worker.postMessage({type: 'run', id, data, H, W}, [data.buffer]);
+}
+function onResult(m){
+  const P = S.pending; if (!P || P.id !== m.id) return;
+  S.pending = null; S.ms = m.ms;
+  const [, C, Hl, Wl] = m.dims;
+  const E = estimateWall({logits: m.logits, C, Hl, Wl, camW: P.camW, projInv: P.projInv, groundY: P.groundY});
+  S.last = E; drawThumb(E); S.mode = 'done';
+  if (E.error){ S.status = E.error === 'nobase' ? 'Не видно стыка стены с полом' : 'Стена не распознана'; return; }
+  const before = S.wall;
+  S.wall = mergeWall(S.wall, E, S.merge, 1 / (S.shots + 1), 2);
+  if (before && S.wall === before) S.status = 'Похоже, это другая стена (↶ — начать заново)';
+  else { S.status = ''; S.shots++; }
 }
 function drawThumb(E){
   if (!thumb || !E.lab) return;
@@ -259,7 +285,7 @@ function drawThumb(E){
   c2.putImageData(img, 0, 0); thumb.style.display = S.active ? 'block' : 'none';
 }
 
-// Каждый кадр: полупрозрачный прямоугольник на стене + рёбра + подписи
+// Каждый кадр: только отрисовка закреплённой стены (без нейросети)
 export function update(cam){
   const {THREE, setBar, placeLabel, labW, labH, cm} = ctx, M = S.wall;
   [quad, eB, eT, eL, eR].forEach(o => o.visible = false);
