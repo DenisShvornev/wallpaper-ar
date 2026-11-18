@@ -1,7 +1,7 @@
 // Авто-режим: левый угол -> правый угол -> потолок по краям, найденным нейросетью.
 // Кадр снимается только когда телефон неподвижен; сегментация и разбор идут в segworker.js.
 // Каждый найденный край закрепляется точкой в мире AR. Калибровка и пол — в calib.js (главный модуль передаёт floorY).
-import {median, findCorner, heightsFrom, heightOnVertical, WALL, CEIL, WALLISH, FLOORISH} from './geom.js?v=7';
+import {median, findCorner, heightsFrom, heightOnVertical, WALL, CEIL, WALLISH, FLOORISH} from './geom.js?v=8';
 
 const STEADY_FRAMES = 10, STILL_POS = 0.006, STILL_ANG = 0.01, NN_LONG = 512;
 const S = {active: false, ready: false, worker: null, device: '', mode: 'idle', // idle | aim | busy | wait
@@ -91,7 +91,7 @@ function acceptCorner(K){
 function load(){
   if (S.worker) return;
   S.status = 'Загрузка нейросети…';
-  try { S.worker = new Worker(new URL('./segworker.js?v=7', import.meta.url), {type: 'module'}); }
+  try { S.worker = new Worker(new URL('./segworker.js?v=8', import.meta.url), {type: 'module'}); }
   catch (e){ S.status = 'Браузер не поддерживает фоновые потоки: ' + (e.message || e); return; }
   S.worker.onmessage = ({data: m}) => {
     if (m.type === 'progress') S.status = 'Загрузка нейросети… ' + m.pct + '%';

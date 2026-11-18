@@ -138,9 +138,9 @@ License: https://github.com/8thwall/engine/blob/main/LICENSE -->
 
 <script type="module">
 import * as THREE from 'three';
-import {heightOnVertical, calcRolls} from './geom.js?v=7';
-import {Calibration} from './calib.js?v=7';
-import * as Auto from './wallseg.js?v=7';
+import {heightOnVertical, calcRolls} from './geom.js?v=8';
+import {Calibration} from './calib.js?v=8';
+import * as Auto from './wallseg.js?v=8';
 window.THREE = THREE;   // нужен XR8.Threejs.pipelineModule()
 
 const $ = id => document.getElementById(id);
@@ -268,9 +268,9 @@ function updateHUD(now){
   hudT = now;
   let trk = 'Трекинг: ' + s.tracking + ' · ' + (s.engine === 'webxr' ? 'WebXR/ARCore' : '8th Wall, absolute scale');
   let hint;
-  if (!calib.ok){ hint = calib.hint(); trk += ' · ищу пол'; }
+  if (!calib.ok){ hint = calib.hint(); trk += ' · ищу пол · хит: ' + (s.rawType || '—') + ' · камера y=' + O.y.toFixed(2); }
   else {
-    trk += ' · пол ' + (O.y - calib.floorY).toFixed(2) + ' м под телефоном';
+    trk += ' · пол ' + (O.y - calib.floorY).toFixed(2) + ' м под телефоном (' + (calib.src || '') + ')';
     if (s.tool === 'auto'){ hint = Auto.hint(); const i = Auto.info(); if (i) trk += ' · ' + i; }
     else if (s.tool === 'wall') hint = ['Наведите на ЛЕВЫЙ угол стены у пола', 'Наведите на ПРАВЫЙ угол стены у пола', 'Поднимите крестик к потолку над синей точкой'][s.step];
     else hint = ['Линейка: первая точка на полу', 'Линейка: вторая точка на полу'][s.step];
@@ -350,6 +350,11 @@ async function start8w(){
   mods.push({
     name: 'wallpaper-calc',
     onStart: () => { const {scene: sc, camera} = XR8.Threejs.xrScene(); getCam = () => camera; initSceneObjects(sc); },
+    // Статус трекинга каждый кадр (на случай, если событие reality.trackingstatus не приходит).
+    onUpdate: ({processCpuResult}) => {
+      const r = processCpuResult && processCpuResult.reality;
+      if (r && r.trackingStatus) state.tracking = r.trackingStatus + (r.trackingReason && r.trackingReason !== 'UNSPECIFIED' ? ' (' + r.trackingReason + ')' : '');
+    },
     onRender: () => {
       if (!ready) return;
       let raw = null;
@@ -359,6 +364,7 @@ async function start8w(){
           const hits = XR8.XrController.hitTest(0.5, 0.5, HIT_TYPES) || [];
           const h = hits.find(x => x.type === 'DETECTED_SURFACE') || hits[0];
           if (h) raw = {y: h.position.y, type: h.type};
+          state.rawType = h ? h.type.replace('_SURFACE', '') : 'нет';
         } catch {}
       }
       onFrame(raw);
@@ -403,6 +409,7 @@ async function startWebXR(){
       M.fromArray(p.transform.matrix); N.setFromMatrixColumn(M, 1);
       if (N.y > 0.85){ raw = {y: p.transform.position.y, type: 'plane'}; break; }
     }
+    state.rawType = raw ? 'plane' : 'нет';
     onFrame(raw);
   });
 }

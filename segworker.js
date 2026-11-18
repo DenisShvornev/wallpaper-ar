@@ -1,7 +1,7 @@
 // Фоновый поток: SegFormer-B0 (ADE20K) + разбор кадра. Главный поток получает только готовые точки и маску.
 // WebGPU (если есть) в разы быстрее WASM; при любой ошибке WebGPU — автоматический откат на WASM q8.
 import {AutoModel, Tensor, env} from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1';
-import {analyze} from './geom.js?v=7';
+import {analyze} from './geom.js?v=8';
 env.allowLocalModels = false;
 
 const MODEL = 'Xenova/segformer-b0-finetuned-ade-512-512';
