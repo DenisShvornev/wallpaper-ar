@@ -143,25 +143,25 @@ export function calibUpdate(cam, st){
   S.app = st;
   const C = S.cal, now = performance.now();
   const trkOk = String(st.tracking || '').startsWith('NORMAL');
-  const floorHit = st.hit && (st.hitType === 'DETECTED_SURFACE' || st.hitType === 'ESTIMATED_SURFACE' || st.hitType === 'plane');
+  const floorHit = st.hit && (st.hitType === 'DETECTED_SURFACE' || st.hitType === 'ESTIMATED_SURFACE' || st.hitType === 'plane' || st.hitType === 'y=0');
   const e = cam.matrixWorld.elements, pos = [e[12], e[13], e[14]];
   if (C.ok){
     if (!trkOk){ C.lostSince ??= now; if (now - C.lostSince > 1500) recalibrate('Трекинг потерян — пройдите калибровку заново'); }
     else C.lostSince = null;
-    if (floorHit && Math.abs(st.hit.y - C.floorY) > 0.05){ if (++C.jump > 30) recalibrate('Пол сместился — нужна новая калибровка'); } else C.jump = 0;
+    if (floorHit){ C.ys.push(st.hit.y); if (C.ys.length > 30) C.ys.shift(); } if (C.ys.length >= 20 && Math.abs(median(C.ys) - C.fl; } else C.jump = 0;
     return C.ok;
   }
-  if (!trkOk){ Object.assign(C, newCal(), {chk: {trk: false}}); return false; }
+  if (!trkOk){ C.lostSince ??= now; if (now - C.lostSince > 2000) Object.assign(C, newCal(), {chk: {trk: false}}); else C.chk.trk
   if (C.last){ const d = Math.hypot(pos[0] - C.last[0], pos[1] - C.last[1], pos[2] - C.last[2]); if (d < 0.2) C.path += d; }
   C.last = pos;
   C.hits.push(floorHit ? 1 : 0); if (C.hits.length > 90) C.hits.shift();
   if (floorHit){ C.ys.push(st.hit.y); if (C.ys.length > 60) C.ys.shift(); }
   const rate = C.hits.reduce((a, b) => a + b, 0) / C.hits.length;
   const fy = median(C.ys) ?? 0, mean = C.ys.reduce((a, b) => a + b, 0) / (C.ys.length || 1);
-  const sd = Math.sqrt(C.ys.reduce((a, b) => a + (b - mean)**2, 0) / (C.ys.length || 1));
+  const sd = median(C.ys.map(y => Math.abs(y - fy))) ?? 1;
   const camH = pos[1] - fy;
-  C.chk = {trk: true, time: (now - C.t0) / 1000, path: C.path, floor: C.ys.length >= 30 && rate >= 0.5 && sd < 0.015, camH};
-  if (C.chk.time >= 4 && C.path >= 1.0 && C.chk.floor && camH > 0.8 && camH < 2.1){
+  C.chk = {trk: true, time: (now - C.t0) / 1000, path: C.path, floor: C.floorOk = C.floorOk || (C.ys.length >= 20 && rate >= 0.3 && sd < 0.03), camH, n: C.ys.length};
+  if (C.chk.time >= 3 && C.path >= 0.7 && C.chk.floor && camH > 0.8 && camH < 2.1){
     C.ok = true; C.floorY = fy; S.groundY = fy; S.status = '';
     if (navigator.vibrate) navigator.vibrate([30, 60, 30]);
   }
@@ -175,11 +175,11 @@ function calibHint(){
   const c = S.cal.chk, ok = b => b ? '✓' : '○';
   const lines = ['КАЛИБРОВКА (обязательно)' + (S.cal.msg ? ': ' + S.cal.msg : '')];
   if (!c.trk){ lines.push('○ Медленно водите телефоном по полу'); return lines.join('\n'); }
-  lines.push(ok(c.floor) + ' Пол найден и стабилен' + (c.floor ? '' : ' — смотрите на пол'));
-  lines.push(ok(c.path >= 1) + ' Пройдите с телефоном ~1 м: ' + Math.min(1, c.path).toFixed(2) + ' / 1.00 м');
+  lines.push(ok(c.floor) + ' Пол найден' + (c.floor ? '' : ' — наведите телефон на пол (' + Math.min(20, c.n || 0) + '/20)'));
+  lines.push(ok(c.path >= 0.7) + ' Пройдите с телефоном ~0.7 м: ' + Math.min(0.7, c.path).toFixed(2) + ' / 0.70 м');
   const hOk = c.camH > 0.8 && c.camH < 2.1;
   lines.push(ok(hOk) + ' Высота телефона над полом: ' + (c.floor ? c.camH.toFixed(2) + ' м' : '—') + (c.floor && !hOk ? ' (неправдоподобно — сбросьте ⟲)' : ''));
-  lines.push(ok(c.time >= 4) + ' Время: ' + Math.min(4, c.time).toFixed(0) + ' / 4 с');
+  lines.push(ok(c.time >= 3) + ' Время: ' + Math.min(3, c.time).toFixed(0) + ' / 3 с');
   return lines.join('\n');
 }
 
@@ -238,7 +238,7 @@ function acceptCorner(K){
 function load(){
   if (S.worker) return;
   S.status = 'Загрузка нейросети…';
-  try { S.worker = new Worker(new URL('./segworker.js?v=4', import.meta.url), {type: 'module'}); }
+  try { S.worker = new Worker(new URL('./segworker.js?v=5', import.meta.url), {type: 'module'}); }
   catch (e){ S.status = 'Браузер не поддерживает фоновые потоки: ' + (e.message || e); return; }
   S.worker.onmessage = ({data: m}) => {
     if (m.type === 'progress') S.status = 'Загрузка нейросети… ' + m.pct + '%';
