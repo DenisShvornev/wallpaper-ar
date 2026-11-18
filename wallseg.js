@@ -238,7 +238,7 @@ function acceptCorner(K){
 function load(){
   if (S.worker) return;
   S.status = 'Загрузка нейросети…';
-  try { S.worker = new Worker(new URL('./segworker.js', import.meta.url), {type: 'module'}); }
+  try { S.worker = new Worker(new URL('./segworker.js?v=4', import.meta.url), {type: 'module'}); }
   catch (e){ S.status = 'Браузер не поддерживает фоновые потоки: ' + (e.message || e); return; }
   S.worker.onmessage = ({data: m}) => {
     if (m.type === 'progress') S.status = 'Загрузка нейросети… ' + m.pct + '%';
