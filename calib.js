@@ -7,8 +7,8 @@
 //  • высота телефона над полом должна быть правдоподобной (0.6–2.2 м) — тихая проверка метрического масштаба;
 //    пока 8th Wall уточняет масштаб, просто просим поводить телефоном.
 // Дальше пол тихо уточняется по новым хитам, при дрейфе трекинга на 3–20 см переустанавливается сам.
-// Сброс — только если трекинг потерян дольше 3 с.
-import {floorCluster} from './geom.js?v=8';
+// Потеря трекинга пол не сбрасывает: на это время главный модуль переходит в режим гироскопа.
+import {floorCluster} from './geom.js?v=10';
 
 export const CAL = {samples: 6, tol: 0.03, camH: [0.6, 2.2], lostReset: 3000};
 
@@ -38,13 +38,8 @@ export class Calibration {
     return null;
   }
   _watch(now, trk, cam, hy){
-    if (!trk){
-      this.lostSince ??= now;
-      if (now - this.lostSince > CAL.lostReset){ this.reset('Трекинг потерян'); return 'lost'; }
-      return null;
-    }
-    this.lostSince = null;
-    if (hy == null) return null;
+    this.trk = trk;
+    if (!trk || hy == null) return null;   // при сбое трекинга главный модуль сам переходит на гироскоп
     this.ys.push(hy); if (this.ys.length > 60) this.ys.shift();
     if (++this.k % 10) return null;
     const c = floorCluster(this.ys, CAL.tol, 20); if (!c || c.n < 20) return null;

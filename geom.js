@@ -2,6 +2,7 @@
 export const WALL = 0, CEIL = 5;
 export const WALLISH = new Set([0, 1, 8, 14, 18, 22, 25, 27]); // wall, building, windowpane, door, curtain, painting, house, mirror
 export const FLOORISH = new Set([3, 6, 11, 13, 28]);           // floor, road, sidewalk, earth, rug
+const EDGE_MARGIN = 1.5;                                       // мин. перепад логитов «стена − пол» на стыке
 
 export const median = a => { if (!a.length) return null; const s = Float64Array.from(a).sort(); return s[s.length >> 1]; };
 
@@ -65,17 +66,24 @@ export function analyze({logits, C, Hl, Wl, camW, projInv, groundY}){
     while (r > Hl * 0.55 && !FLOORISH.has(lab[r*Wl + c])) r--;
     if (FLOORISH.has(lab[r*Wl + c])){
       while (r >= 0 && FLOORISH.has(lab[r*Wl + c])) r--;
-      if (r >= 1 && WALLISH.has(lab[r*Wl + c]) && WALLISH.has(lab[(r-1)*Wl + c])){
+      // Надёжный стык: 2 пикселя стены над ним и 2 пикселя пола под ним, резкий переход логитов.
+      // Отсекает шум на плинтусах, тенях и краях мебели.
+      const W2 = r >= 2 && WALLISH.has(lab[r*Wl + c]) && WALLISH.has(lab[(r-1)*Wl + c]) && WALLISH.has(lab[(r-2)*Wl + c]);
+      const F2 = r + 2 < Hl && FLOORISH.has(lab[(r+2)*Wl + c]);
+      if (W2 && F2){
         const k = lab[r*Wl + c], fk = lab[(r+1)*Wl + c];
         const d0 = L(k, r, c) - L(fk, r, c), d1 = L(k, r+1, c) - L(fk, r+1, c);
-        const t = d0 - d1 > 1e-6 ? Math.min(1, Math.max(0, d0 / (d0 - d1))) : 0.5;
-        const d = rayDir(camW, projInv, (c + 0.5) / Wl, (r + 0.5 + t) / Hl);
-        if (d[1] < -0.02){ const s = (groundY - cam[1]) / d[1]; if (s > 0 && s < 10) pts.push({c, x: cam[0] + d[0]*s, z: cam[2] + d[2]*s}); }
+        if (d0 - d1 > EDGE_MARGIN){
+          const t = Math.min(1, Math.max(0, d0 / (d0 - d1)));
+          const d = rayDir(camW, projInv, (c + 0.5) / Wl, (r + 0.5 + t) / Hl);
+          // скользящие лучи (почти горизонтальные) дают огромную ошибку по дальности — не берём
+          if (d[1] < -0.07){ const s = (groundY - cam[1]) / d[1]; const hd = s * Math.hypot(d[0], d[2]); if (s > 0 && hd > 0.4 && hd < 7) pts.push({c, x: cam[0] + d[0]*s, z: cam[2] + d[2]*s}); }
+        }
       }
     }
     if (lab[c] === CEIL){
       let r0 = 0; while (r0 < Hl && lab[r0*Wl + c] === CEIL) r0++;
-      if (r0 < Hl - 1 && WALLISH.has(lab[r0*Wl + c])){
+      if (r0 >= 2 && r0 < Hl - 2 && WALLISH.has(lab[r0*Wl + c]) && WALLISH.has(lab[(r0+1)*Wl + c])){
         const k = lab[r0*Wl + c];
         const dA = L(k, r0-1, c) - L(CEIL, r0-1, c), dB = L(k, r0, c) - L(CEIL, r0, c);
         const t = dB - dA > 1e-6 ? Math.min(1, Math.max(0, -dA / (dB - dA))) : 0.5;

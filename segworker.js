@@ -1,8 +1,10 @@
 // Фоновый поток: SegFormer-B0 (ADE20K) + разбор кадра. Главный поток получает только готовые точки и маску.
 // WebGPU (если есть) в разы быстрее WASM; при любой ошибке WebGPU — автоматический откат на WASM q8.
 import {AutoModel, Tensor, env} from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1';
-import {analyze} from './geom.js?v=8';
+import {analyze} from './geom.js?v=10';
 env.allowLocalModels = false;
+// Многопоточный WASM доступен только при cross-origin isolation (заголовки COOP/COEP на хостинге).
+if (self.crossOriginIsolated && env.backends?.onnx?.wasm) env.backends.onnx.wasm.numThreads = Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 2) - 2));
 
 const MODEL = 'Xenova/segformer-b0-finetuned-ade-512-512';
 const MEAN = [0.485, 0.456, 0.406], STD = [0.229, 0.224, 0.225];
