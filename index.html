@@ -94,7 +94,7 @@ License: https://github.com/8thwall/engine/blob/main/LICENSE -->
     <div id="toast"></div>
     <div id="bottombar">
       <div style="display:flex;flex-direction:column;gap:8px">
-        <div class="seg"><button id="toolWall" class="on">Стена</button><button id="toolLine">Линейка</button></div>
+        <div class="seg"><button id="toolWall" class="on">Стена</button><button id="toolAuto">Авто</button><button id="toolLine">Линейка</button></div>
         <div style="display:flex;gap:8px"><button id="btnUndo">↶</button><button id="btnRecenter" title="Сброс трекинга">⟲</button><button id="btnExit" class="hidden">✕</button></div>
       </div>
       <button id="btnPlace" class="primary">＋</button>
@@ -135,7 +135,7 @@ License: https://github.com/8thwall/engine/blob/main/LICENSE -->
 </div>
 
 <script type="module">
-import * as THREE from 'three';
+import * as THREE from 'three'; import * as Auto from './wallseg.js';
 window.THREE = THREE;
 
 const $ = id => document.getElementById(id);
@@ -167,7 +167,7 @@ function initSceneObjects(sc){
   reticle.renderOrder = 10; reticle.visible = false; g.add(reticle);
   const dot = c => { const m = new THREE.Mesh(new THREE.SphereGeometry(0.018, 16, 12), new THREE.MeshBasicMaterial({color:c, depthTest:false})); m.renderOrder = 11; m.visible = false; g.add(m); return m; };
   const bar = c => { const m = new THREE.Mesh(new THREE.CylinderGeometry(0.006, 0.006, 1, 8), new THREE.MeshBasicMaterial({color:c, depthTest:false})); m.renderOrder = 11; m.visible = false; g.add(m); return m; };
-  dotA = dot(0x22c55e); dotB = dot(0x3b82f6); barAB = bar(0xfacc15); barV = bar(0xff4d6d);
+  dotA = dot(0x22c55e); dotB = dot(0x3b82f6); barAB = bar(0xfacc15); barV = bar(0xff4d6d); Auto.init({THREE, group: g, setBar, placeLabel, labW, labH, cm});
 }
 const UP = new V3(0,1,0);
 function setBar(m, a, b){
@@ -209,7 +209,7 @@ function viewCam(){
   return c;
 }
 function tick(){
-  const cam = viewCam(); if (!cam || !reticle) return;
+  const cam = viewCam(); if (!cam || !reticle) return; if (state.tool === 'auto'){ Auto.update(cam); updateHUD(); return; }
   O.setFromMatrixPosition(cam.matrixWorld);
   D.set(0, 0, -1).transformDirection(cam.matrixWorld);
   const s = state;
@@ -239,14 +239,14 @@ function tick(){
 let lastHud = '';
 function updateHUD(){
   const s = state;
-  const trk = 'Трекинг: ' + s.tracking + ' · ' + (s.engine === 'webxr' ? 'WebXR/ARCore' : '8th Wall, absolute scale') + ' · пол: ' + (s.hit ? s.hitType : 'не найден');
+  let trk = 'Трекинг: ' + s.tracking + ' · ' + (s.engine === 'webxr' ? 'WebXR/ARCore' : '8th Wall, absolute scale') + ' · пол: ' + (s.hit ? s.hitType : 'не найден');
   let hint;
   if (s.tool === 'wall') hint = ['Наведите на ЛЕВЫЙ угол стены у пола', 'Наведите на ПРАВЫЙ угол стены у пола', 'Поднимите крестик к потолку над синей точкой'][s.step];
   else hint = ['Линейка: первая точка на полу', 'Линейка: вторая точка на полу'][s.step];
-  const h = trk + '|' + hint;
+  if (s.tool === 'auto'){ hint = Auto.hint(); trk += ' · ' + Auto.info(); } const h = trk + '|' + hint;
   if (h !== lastHud){ $('topbar').textContent = trk; $('hint').textContent = hint; lastHud = h; }
   const needHit = !(s.tool === 'wall' && s.step === 2);
-  $('btnPlace').disabled = needHit ? !s.hit : !(s.liveH > 0.05);
+  $('btnPlace').disabled = needHit ? !s.hit : !(s.liveH > 0.05); if (s.tool === 'auto') $('btnPlace').disabled = !Auto.canSave();
 }
 let toastT;
 function toast(msg){ const t = $('toast'); t.textContent = msg; t.style.opacity = 1; clearTimeout(toastT); toastT = setTimeout(() => t.style.opacity = 0, 2200); }
@@ -288,7 +288,7 @@ function addMeasurement(m){
   save(); $('cnt').textContent = state.measurements.length;
 }
 function setTool(t){
-  state.tool = t; state.step = 0; clearVisuals();
+  state.tool = t; state.step = 0; clearVisuals(); Auto.setActive(t === 'auto'); $('btnPlace').textContent = t === 'auto' ? '✓' : 
   $('toolWall').classList.toggle('on', t === 'wall'); $('toolLine').classList.toggle('on', t === 'line');
 }
 
@@ -311,7 +311,7 @@ async function start8w(){
   const canvas = $('xr8canvas'); canvas.style.display = 'block'; sizeCanvas(canvas);
   state.engine = '8thwall';
   XR8.XrController.configure({scale: 'absolute'});
-  const mods = [XR8.GlTextureRenderer.pipelineModule(), XR8.Threejs.pipelineModule(), XR8.XrController.pipelineModule()];
+  const mods = [XR8.GlTextureRenderer.pipelineModule(), Auto.grabModule(() => getCam && getCam()), XR8.Threejs.pipelineModule(), XR8.XrController.pipelineModule()];
   if (XR8.FullWindowCanvas) mods.push(XR8.FullWindowCanvas.pipelineModule());
   else addEventListener('resize', () => sizeCanvas(canvas));
   mods.push({
@@ -321,7 +321,7 @@ async function start8w(){
       if (!scene) return;
       let hits = [];
       try { hits = XR8.XrController.hitTest(0.5, 0.5, ['DETECTED_SURFACE', 'ESTIMATED_SURFACE']) || []; } catch {}
-      if (hits.length){ const p = hits[0].position; state.hit = new V3(p.x, p.y, p.z); state.hitType = hits[0].type; }
+      if (hits.length){ const p = hits[0].position; state.hit = new V3(p.x, p.y, p.z); state.hitType = hits[0].type; Auto.setGround(p.y); }
       else {
         const cam = viewCam();
         if (cam){ O.setFromMatrixPosition(cam.matrixWorld); D.set(0,0,-1).transformDirection(cam.matrixWorld);
@@ -407,7 +407,7 @@ function renderPanel(){
     const a = errs[k].map(Math.abs), mean = a.reduce((x, y) => x + y, 0) / a.length, max = Math.max(...a);
     const sorted = [...a].sort((x, y) => x - y), med = sorted[Math.floor(sorted.length/2)];
     const bias = errs[k].reduce((x, y) => x + y, 0) / a.length;
-    return `<div><b>${k === 'webxr' ? 'WebXR/ARCore' : '8th Wall'}</b> — сравнений: ${a.length}<br>
+    return `<div><b>${k === 'webxr' ? 'WebXR/ARCore' : k === '8thwall-auto' ? '8th Wall + нейросеть' : '8th Wall'}</b> — сравнений: ${a.length}<br>
       средняя |ошибка|: <b class="${cls(mean)}">${mean.toFixed(1)}%</b> · медиана ${med.toFixed(1)}% · максимум <span class="${cls(max)}">${max.toFixed(1)}%</span><br>
       <span class="mut">систематический сдвиг ${bias > 0 ? '+' : ''}${bias.toFixed(1)}% (${bias > 0 ? 'завышает' : 'занижает'})</span></div>`;
   }).join('<hr style="border-color:#2a2f3a">');
@@ -415,7 +415,7 @@ function renderPanel(){
   $('list').innerHTML = !ms.length ? '<span class="mut">Пока пусто.</span>' : ms.slice().reverse().map(m => {
     const eW = m.refW ? errPct(m.w, m.refW) : null, eH = m.type === 'wall' && m.refH ? errPct(m.h, m.refH) : null;
     return `<div class="m" data-id="${m.id}">
-      <div class="row"><div><b>${m.type === 'wall' ? 'Стена' : 'Линейка'}</b> · ${m.engine === 'webxr' ? 'WebXR' : '8th Wall'}<br>
+      <div class="row"><div><b>${m.type === 'wall' ? 'Стена' : 'Линейка'}</b> · ${m.engine === 'webxr' ? 'WebXR' : m.engine === '8thwall-auto' ? 'Авто' : '8th Wall'}<br>
         <span class="mut">Ш ${cm(m.w)}${m.type === 'wall' ? ' · В ' + cm(m.h) : ''}</span></div>
         <button data-del="${m.id}">✕</button></div>
       <div class="refs">
@@ -454,8 +454,8 @@ function fail(msg){ $('hud').classList.add('hidden'); $('start').classList.remov
 function openPanel(){ renderPanel(); $('panel').classList.remove('hidden'); }
 $('btnPanel').onclick = openPanel; $('btnList').onclick = openPanel;
 $('btnClose').onclick = () => $('panel').classList.add('hidden');
-$('btnPlace').onclick = place; $('tapzone').addEventListener('click', () => { if (!$('btnPlace').disabled) place(); }); $('btnUndo').onclick = undo;
-$('toolWall').onclick = () => setTool('wall'); $('toolLine').onclick = () => setTool('line');
+$('btnPlace').onclick = () => state.tool === 'auto' ? Auto.save(addMeasurement, toast) : place(); $('tapzone').addEventListener('click', () => { if (state.tool !== 'auto' && !$('btnPlace').disabled) place(); }); $('btnUndo').onclick = () => state.tool === 'auto' ? Auto.reset() : undo();
+$('toolWall').onclick = () => setTool('wall'); $('toolLine').onclick = () => setTool('line'); $('toolAuto').onclick = () => state.engine === '8thwall' ? setTool('auto') : toa
 $('btnRecenter').onclick = () => { try { window.XR8?.XrController.recenter(); } catch {} setTool(state.tool); toast('Трекинг сброшен — снова поводите телефоном по полу'); };
 $('ui').addEventListener('beforexrselect', e => e.preventDefault());
 
